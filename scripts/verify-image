@@ -116,6 +116,9 @@ check "chronyd is client-only"    "grep -q '^port 0' $R/etc/chrony/conf.d/10-app
 # The check that would have caught an unreachable node. Empty CLOUD_USER makes tiny-cloud skip installing
 # the SSH keys DigitalOcean injects, leaving a Droplet that boots, runs sshd, and admits nobody.
 check "cloud user is root"        "grep -q '^CLOUD_USER=root' $R/etc/tiny-cloud.conf"
+# Reachability of this node cannot depend on tiny-cloud, which installs no keys at all when CLOUD_USER
+# is unset and reports it only as an info line in the system log.
+check "own key installer present" "test -x $R/etc/init.d/cloud-ssh-keys"
 check "root password locked"      "grep '^root:' $R/etc/shadow | grep -qE '^root:[!*]'"
 
 # Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names
@@ -154,7 +157,7 @@ echo "==> services"
 for s in apparmor tiny-cloud-boot; do
 	check "$s enabled at boot"    "test -L $R/etc/runlevels/boot/$s"
 done
-for s in openbao sshd chronyd tiny-cloud-main openbao-pod-routes; do
+for s in openbao sshd chronyd tiny-cloud-main openbao-pod-routes cloud-ssh-keys; do
 	check "$s enabled by default" "test -L $R/etc/runlevels/default/$s"
 done
 

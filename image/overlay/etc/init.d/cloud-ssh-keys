@@ -1,0 +1,70 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # openrc-run reads these variables out of this file.
+# Installs the operator's SSH key from the DigitalOcean metadata service.
+#
+# This exists because tiny-cloud could not be relied on for it, and being unable to log in to the node
+# holding every production credential is the worst failure this image has. tiny-cloud's DigitalOcean
+# module carries a literal "TODO: flesh out networking" and unsets every network metadata variable, its
+# set_ssh_keys writes nothing at all when CLOUD_USER is unset -- which is how it ships -- and when it
+# does fail it logs "no ssh key found" and lets the boot continue to a login prompt nobody can use.
+#
+# So this does the one job directly, retries rather than giving up on a slow network, and treats failure
+# as a failure. It is idempotent and additive: an operator key added by hand is never removed.
+
+description="Install SSH keys from the cloud metadata service"
+
+: "${IMDS_URL:=http://169.254.169.254/metadata/v1}"
+: "${KEY_ATTEMPTS:=15}"
+
+depend() {
+	need net
+	before sshd
+	after tiny-cloud-main
+}
+
+start() {
+	keys_dir=/root/.ssh
+	keys_file="$keys_dir/authorized_keys"
+
+	# Retried, because "the network is up" and "the metadata service answers" are not the same instant.
+	# The working Debian node reaches this address through the ordinary default gateway, so no
+	# link-local route is needed -- if this never succeeds, the node has no usable default route.
+	ebegin "Fetching SSH keys from $IMDS_URL"
+	keys=""
+	attempt=0
+	while [ "$attempt" -lt "$KEY_ATTEMPTS" ]; do
+		keys="$(wget -qO- -T 3 "$IMDS_URL/public-keys" 2>/dev/null || true)"
+		[ -n "$keys" ] && break
+		attempt=$((attempt + 1))
+		sleep 2
+	done
+
+	# The fallback that makes a node recoverable when the metadata service is unreachable at first boot.
+	# DigitalOcean serves user-data from the same place, so this is a second read rather than a second
+	# mechanism -- but an operator can also paste keys into user-data when IMDS itself is the problem.
+	if [ -z "$keys" ]; then
+		ewarn "No keys from public-keys after $KEY_ATTEMPTS attempts; trying user-data"
+		keys="$(wget -qO- -T 3 "$IMDS_URL/user-data" 2>/dev/null | grep -E '^(ssh-|ecdsa-)' || true)"
+	fi
+
+	if [ -z "$keys" ]; then
+		eend 1 "No SSH keys available; this node will be unreachable"
+		return 1
+	fi
+
+	install -d -o root -g root -m 0700 "$keys_dir"
+	touch "$keys_file"
+	chown root:root "$keys_file"
+	chmod 0600 "$keys_file"
+
+	# Additive and idempotent. A key installed by an operator during recovery outlives a reboot, and a
+	# key already present is not duplicated.
+	echo "$keys" | while IFS= read -r key; do
+		[ -n "$key" ] || continue
+		grep -qxF "$key" "$keys_file" || echo "$key" >> "$keys_file"
+	done
+
+	eend 0
+	einfo "Installed $(grep -c . "$keys_file") key(s) for root"
+}

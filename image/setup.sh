@@ -90,6 +90,8 @@ rc-update add tiny-cloud-early default
 rc-update add tiny-cloud-main default
 rc-update add tiny-cloud-final default
 rc-update add chronyd default   # client-only; see /etc/chrony/conf.d/10-appliance.conf
+# Before sshd, and not trusting tiny-cloud to have done it. See the service for why.
+rc-update add cloud-ssh-keys default
 rc-update add sshd default
 rc-update add openbao-pod-routes default
 
