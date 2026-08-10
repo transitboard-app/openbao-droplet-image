@@ -128,7 +128,11 @@ check "net.lo enabled at boot"    "test -L $R/etc/runlevels/boot/net.lo"
 check "private interface defined" "grep -q '^iface eth1 inet dhcp' $R/etc/network/interfaces"
 # Without this, a Droplet with no VPC interface leaves `net` unsatisfied and nothing that needs it runs.
 check "net deps are not strict"   "grep -q '^rc_depend_strict=\"NO\"' $R/etc/rc.conf"
-check "root password locked"      "grep '^root:' $R/etc/shadow | grep -qE '^root:[!*]'"
+# `*` specifically, never `!`. The previous version of this check accepted either and therefore passed
+# on an image whose every Droplet refused the operator's key: `!` marks the account locked, and Alpine's
+# PAM-less sshd refuses a locked account before it reads authorized_keys.
+check "root has no password"      "grep -q '^root:\\*:' $R/etc/shadow"
+check "root is NOT locked"        "! grep -q '^root:!' $R/etc/shadow"
 
 # Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names
 # point at. `mount` is the one that matters -- OpenRC cannot mount /run without it and gives up before

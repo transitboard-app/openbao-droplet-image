@@ -264,6 +264,26 @@ description = "Build the appliance image (needs root)"
 depends = ["stage"]
 run = [{ task = "build:image" }, { task = "build:compact" }, { task = "build:assert" }]
 
+# Builds a diagnostic image with password authentication enabled, for when a Droplet boots unreachable
+# and there is no other way to read it. Deliberately not part of `build`, deliberately given its own
+# output name, and it cannot pass `verify` -- which asserts the opposite of everything it does.
+[tasks.debug]
+description = "Build a DEBUG image with password auth (never release this)"
+depends = ["stage"]
+usage = """
+flag "--password <password>" help="Root password to bake in" default="debug-only-throwaway"
+"""
+run = [
+	"""echo "{{ usage.password }}" > {{ vars.stage_dir }}/debug-password""",
+	{ task = "build:image" },
+	{ task = "build:compact" },
+	{ task = "build:assert" },
+	"""mv "$IMAGE" "$OUT_DIR/openbao-appliance-DEBUG.qcow2" """,
+	"""rm -f {{ vars.stage_dir }}/debug-password""",
+	"""bzip2 --keep --force --best "$OUT_DIR/openbao-appliance-DEBUG.qcow2" """,
+	"""ls -lh "$OUT_DIR/openbao-appliance-DEBUG.qcow2.bz2" """,
+]
+
 [tasks.verify]
 description = "Assert the built image's contents without booting it"
 run = "sudo {{ config_root }}/scripts/verify-image {{ env.IMAGE }}"

@@ -150,7 +150,50 @@ grep -q '^CLOUD_USER=root' /etc/tiny-cloud.conf || {
 }
 
 echo "==> hardening"
-passwd -l root
+# NOT `passwd -l root`, and the difference is the whole reachability of this image.
+#
+# `passwd -l` prefixes the shadow hash with `!`, which marks the account LOCKED. Alpine builds sshd
+# without PAM, and OpenSSH refuses a locked account outright -- before it ever looks at authorized_keys.
+# So every Droplet from this image had the operator's key installed correctly and was still refused with
+# "Permission denied (publickey)". It cost five rounds of chasing tiny-cloud, CLOUD_USER, metadata
+# routing and OpenRC ordering, all of which were real bugs and none of which were this one.
+#
+# Setting the field to `*` gives the same property that was actually wanted -- no password can ever match
+# -- without setting the lock flag. Measured on a live Droplet: with `!` key auth is refused, with `*` it
+# succeeds, everything else identical.
+sed -i 's|^root:[^:]*:|root:*:|' /etc/shadow
+grep -q '^root:\*:' /etc/shadow || {
+	echo "FATAL: root's password field is not '*'; the node would be unreachable" >&2
+	exit 1
+}
+
+# A DEBUG BUILD, and never a released one.
+#
+# When the stage directory carries a debug-password file, this unlocks root and turns on password
+# authentication so the DigitalOcean console and plain ssh both work. It exists because this image can
+# boot unreachable, and a node nobody can log into cannot be diagnosed -- which has now cost five
+# rounds of inference from outside the machine.
+#
+# scripts/verify-image asserts the opposite of everything here ("root password locked", "password auth
+# disabled"), so a debug image cannot pass verification and therefore cannot be released by the
+# workflow. The marker file is a second, human-readable tripwire.
+if [ -f /mnt/debug-password ]; then
+	echo "    *** DEBUG BUILD: password authentication enabled ***"
+	printf 'root:%s' "$(cat /mnt/debug-password)" | chpasswd
+	# 00-, not 99-: sshd takes the FIRST obtained value for each keyword, and the include glob is read in
+	# lexical order, so 10-appliance.conf's `PasswordAuthentication no` wins against anything sorting
+	# after it. A 99- prefix produced an sshd that ignored every line in this file.
+	cat > /etc/ssh/sshd_config.d/00-debug.conf <<-'DEBUG'
+	# DEBUG BUILD ONLY. Must sort before 10-appliance.conf to take effect.
+	PasswordAuthentication yes
+	AuthenticationMethods any
+	PermitRootLogin yes
+	DEBUG
+	cat > /etc/APPLIANCE-DEBUG <<-'MARKER'
+	This image was built with debug password authentication enabled.
+	It is a diagnostic artifact and must never be deployed.
+	MARKER
+fi
 
 # No swap is configured and none should be. CAP_IPC_LOCK plus mlock is the primary control (OpenBao's
 # `disable_mlock` is deliberately absent from the shipped config); the absence of swap is the backstop
