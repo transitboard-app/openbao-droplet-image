@@ -55,9 +55,16 @@ bin = "alpine-make-vm-image"
 alpine_branch = "v3.24"
 alpine_mirror = "https://dl-cdn.alpinelinux.org/alpine"
 
-# 1 GiB against a `bao` binary of 186 MiB and a kernel of about 80 MiB. Deliberately loose: tiny-cloud
-# grows the root filesystem to fill the Droplet's disk on first boot (measured -- a 1 GiB image on a
-# 5 GiB disk ended at 5118 MiB), so this only controls how much empty space is uploaded.
+# The VIRTUAL disk size, which is not the artifact size and does not affect it. qcow2 is sparse: the
+# image measures 286 MiB used of 989 MiB (32% full) and the file on disk is 336 MiB, because the empty
+# 700 MiB is described rather than stored. Raising or lowering this does not change what gets uploaded.
+#
+# What it does control is build headroom -- apk needs working space above the 286 MiB of content -- and
+# a ceiling it must stay under, since the image cannot be larger than the disk it is restored onto and
+# DigitalOcean's smallest Droplet has 25 GiB. 1 GiB is comfortable at both ends.
+#
+# It has no effect on a running node at all: tiny-cloud grows the root filesystem to fill the Droplet's
+# disk on first boot, measured -- this image on a 5 GiB disk ends with a 5118 MiB root filesystem.
 image_size = "1G"
 image_name = "openbao-appliance"
 
