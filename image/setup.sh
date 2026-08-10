@@ -77,6 +77,34 @@ grep -q "console=ttyS0" /boot/extlinux.conf || {
 echo "    $(grep -m1 'APPEND' /boot/extlinux.conf | tr -s ' ')"
 
 echo "==> networking"
+# Written HERE rather than shipped in the overlay, because alpine-make-vm-image generates this file
+# itself after the skel rsync and its version wins. Discovered by an assertion failing on a built image.
+#
+# There are deliberately NO post-up hook lines. The generated file ends with
+# `post-up /etc/network/if-post-up.d/*`; that directory does not exist, the glob never expands, and sh
+# fails on the literal path -- so ifup reports failure for an interface whose DHCP lease it had just
+# obtained. And because options after an `iface` stanza belong to that stanza, those trailing lines bind
+# to the LAST one, eth1: net.eth1 stayed permanently failed while eth1 held an address configured by
+# tiny-cloud instead. A working interface for the wrong reason, which is the failure mode this whole
+# image has taught us to distrust.
+cat > /etc/network/interfaces <<-'INTERFACES'
+	auto lo
+	iface lo inet loopback
+
+	# DigitalOcean serves DHCP on both interfaces for custom images. Its DHCP runs on port 67, so an
+	# outbound UDP rule for it is required if a firewall is ever applied to this Droplet.
+	auto eth0
+	iface eth0 inet dhcp
+
+	# The VPC interface, and the one this appliance exists to serve on: OpenBao advertises its private
+	# address, the Agent sidecars dial it, and the firewall admits 8200 from nowhere else.
+	auto eth1
+	iface eth1 inet dhcp
+INTERFACES
+grep -q 'if-post-up.d' /etc/network/interfaces && {
+	echo "FATAL: the generated ifup hooks survived; net.eth1 would fail" >&2
+	exit 1
+}
 # The per-interface services Alpine expects, and which alpine-make-vm-image does not create. Without
 # these, `networking` is in no runlevel, nothing provides `net`, and every service that needs it never
 # runs -- see the comment in /etc/network/interfaces for the full failure.

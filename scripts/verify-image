@@ -126,6 +126,9 @@ check "net.eth1 enabled"          "test -L $R/etc/runlevels/default/net.eth1"
 check "net.lo enabled at boot"    "test -L $R/etc/runlevels/boot/net.lo"
 # OpenBao advertises its private address and the firewall admits 8200 from nowhere else.
 check "private interface defined" "grep -q '^iface eth1 inet dhcp' $R/etc/network/interfaces"
+# The hook glob points at a directory that does not exist, so ifup fails on an interface whose DHCP
+# lease succeeded -- and being trailing lines, they bind to the LAST stanza, which is eth1.
+check "no dangling ifup hooks"    "! grep -q 'if-post-up.d\|if-post-down.d' $R/etc/network/interfaces"
 # Without this, a Droplet with no VPC interface leaves `net` unsatisfied and nothing that needs it runs.
 check "net deps are not strict"   "grep -q '^rc_depend_strict=\"NO\"' $R/etc/rc.conf"
 # `*` specifically, never `!`. The previous version of this check accepted either and therefore passed
