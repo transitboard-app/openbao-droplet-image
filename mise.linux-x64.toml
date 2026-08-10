@@ -1,0 +1,282 @@
+
+# openbao-droplet-image
+#
+# Builds the DigitalOcean custom image the OpenBao Droplets boot: a single-purpose Alpine appliance
+# running OpenBao directly on the host, with no container runtime.
+#
+# **This is the only configuration, and it loads only on linux-x64.** There is deliberately no plain
+# mise.toml: assembly mounts an ext4 filesystem and chroots into it, so it needs a Linux kernel with ext4
+# and root, and a half-working setup on another platform is worth less than no setup at all. On macOS
+# this directory simply has no tasks.
+#
+# `.miserc.toml` sets `auto_env = true`, which is what selects this file by platform without MISE_ENV
+# being set by hand.
+#
+# The host does NOT need to be Alpine. alpine-make-vm-image installs host packages only when it detects
+# /etc/alpine-release, and everywhere else downloads checksum-verified static apk-tools 2.14.10 and uses
+# that -- which is why ubuntu-24.04 is a fine place to build, and why the apk-tools 3 incompatibility
+# that breaks an Alpine host does not arise here.
+
+[tools]
+# OpenBao itself. The appliance's entire payload is this binary, and mise fetching it replaces what used
+# to be a Docker pull, a container export, a tar extraction and a hand-maintained sha256 pin.
+#
+# Because this file only loads on linux-x64, this resolves to the binary the image needs or to nothing.
+#
+# Same source and version as stack's own mise.toml, deliberately. What it is NOT is the same artifact as
+# stack's `openbao_image`, which pins the distroless CONTAINER by digest; this is the release binary from
+# the same tag. They should be identical bytes and that has not been proved -- `mise run compare-upstream`
+# does it on demand. Once the appliance replaces the container, `openbao_image` in
+# stack/infrastructure/platform/variables.tf is vestigial and should go.
+"github:openbao/openbao" = "2.6.1"
+shellcheck = "latest"
+
+# alpine-make-vm-image, which is a single POSIX shell script rather than a release artifact -- no tarball,
+# no per-platform builds, just a file in a git tag. The http backend handles exactly that: it fetches the
+# URL, checks it against the checksum below, and puts it on PATH.
+#
+# `checksum` is the whole supply-chain control for a script that runs as root with block-device access,
+# and mise refuses to install on a mismatch. `size` is a second, cheaper tripwire on the same bytes.
+#
+# This replaced a hand-written task that curled the file, ran sha256sum -c, and chmod +x'd it, with
+# `sources`/`outputs` to avoid refetching. mise does all of that.
+[tools."http:alpine-make-vm-image"]
+version = "0.13.4"
+url = "https://raw.githubusercontent.com/alpinelinux/alpine-make-vm-image/v{{version}}/alpine-make-vm-image"
+checksum = "sha256:c643b7f894e34575836c4835bd2ded6f27958ea5212c1295b4f82ccd0b670029"
+size = 26912
+bin = "alpine-make-vm-image"
+
+[vars]
+# Alpine's release branch. A branch rather than `latest-stable`, which moves under you and would make two
+# builds a month apart different machines -- the problem this image exists to remove from stack's
+# cloud-init. It does not pin package versions within the branch, so a rebuild picks up security updates;
+# /etc/openbao-appliance-packages inside the image records what a given build actually got.
+alpine_branch = "v3.24"
+alpine_mirror = "https://dl-cdn.alpinelinux.org/alpine"
+
+# 1 GiB against a `bao` binary of 186 MiB and a kernel of about 80 MiB. Deliberately loose: tiny-cloud
+# grows the root filesystem to fill the Droplet's disk on first boot (measured -- a 1 GiB image on a
+# 5 GiB disk ended at 5118 MiB), so this only controls how much empty space is uploaded.
+image_size = "1G"
+image_name = "openbao-appliance"
+
+[env]
+OUT_DIR = "{{ config_root }}/out"
+BUILD_DIR = "{{ config_root }}/.build"
+IMAGE = "{{ config_root }}/out/{{ vars.image_name }}.qcow2"
+
+# The system packages alpine-make-vm-image needs. These are OS packages rather than registry tools, so no
+# [tools] entry can supply them; `mise bootstrap packages apply` installs them, and mise never installs
+# system packages implicitly.
+#
+# Both managers are declared and mise acts only on the one present, so this covers a Debian CI runner and
+# an Alpine builder with no conditional. Values are plain strings: mise's docs show a table form carrying
+# an `os` selector, but mise 2026.8.3 rejects it with `invalid type: map, expected a string`. It is moot
+# here anyway, since this whole file only loads on linux-x64.
+#
+# Package names differ between the two: apt's qemu-utils carries qemu-img and qemu-nbd, and its sfdisk
+# lives in fdisk.
+[bootstrap.packages]
+# wget, needed because alpine-make-vm-image fetches static apk-tools with it on any non-Alpine host, and
+# Ubuntu's minimal images ship curl but not wget. Without it the build stops at
+# `wget: not found` before writing anything.
+"apt:wget" = "latest"
+"apt:qemu-utils" = "latest"
+"apt:qemu-system-x86" = "latest"
+"apt:rsync" = "latest"
+"apt:fdisk" = "latest"
+"apt:e2fsprogs" = "latest"
+"apt:util-linux" = "latest"
+"apk:wget" = "latest"
+"apk:qemu-img" = "latest"
+"apk:qemu-system-x86_64" = "latest"
+"apk:rsync" = "latest"
+"apk:sfdisk" = "latest"
+"apk:e2fsprogs" = "latest"
+"apk:util-linux" = "latest"
+
+# What [bootstrap.packages] cannot supply: a kernel feature. ext4 here is not a package but whether the
+# running kernel can mount one, and the error it produces three layers down names neither ext4 nor the
+# kernel. DigitalOcean requires ext3 or ext4, so btrfs is not a substitute where it is offered instead.
+[tasks.deps]
+description = "Check the host can do what the build needs"
+run = '''
+set -eu
+missing=""
+for tool in qemu-img qemu-nbd rsync sfdisk mkfs.ext4 losetup wget; do
+	command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+	echo "missing:$missing" >&2
+	echo "  mise bootstrap packages apply" >&2
+	exit 1
+fi
+
+if ! grep -qw ext4 /proc/filesystems 2>/dev/null; then
+	echo "this kernel has no ext4 support ($(uname -sr))" >&2
+	echo "filesystems: $(awk '{print $NF}' /proc/filesystems 2>/dev/null | tr '\n' ' ')" >&2
+	echo >&2
+	echo "On OrbStack the module exists but is not loaded, and a container cannot load it:" >&2
+	echo "  sudo modprobe ext4      # from inside any OrbStack Linux machine" >&2
+	echo "It does not survive an OrbStack restart. ubuntu-24.04 in CI needs nothing extra." >&2
+	exit 1
+fi
+echo "system dependencies and ext4: ok"
+'''
+
+# Two staging directories with different jobs, which is why this is a step of its own:
+#   skel  is rsynced into / by --fs-skel-dir. Configuration only.
+#   stage is bind-mounted at /mnt inside the chroot by --script-chroot, and carries setup.sh and the
+#         186 MiB binary, which setup.sh installs rather than rsync staging it a second time.
+[tasks.stage]
+description = "Assemble the overlay and chroot staging directories"
+depends = ["deps"]
+sources = ["image/**/*"]
+outputs = ["{{ config_root }}/.build/stage/setup.sh"]
+run = [
+	"rm -rf {{ config_root }}/.build/skel {{ config_root }}/.build/stage",
+	"mkdir -p {{ config_root }}/.build/skel {{ config_root }}/.build/stage",
+	"cp -a {{ config_root }}/image/overlay/. {{ config_root }}/.build/skel/",
+	"install -m 0755 {{ config_root }}/image/setup.sh {{ config_root }}/.build/stage/setup.sh",
+	# mise put this on PATH from [tools] above; here it is exactly the binary the image needs.
+	"""install -m 0755 "$(command -v bao)" {{ config_root }}/.build/stage/bao""",
+	# Asserted, not assumed: a staged binary of the wrong architecture would not surface until a Droplet
+	# booted and OpenBao never started.
+	#
+	# Read straight out of the ELF header rather than through `file`, which is not installed on a minimal
+	# Ubuntu and is not worth a package. Bytes 18-19 are e_machine, little-endian; 0x003e is x86-64.
+	"""test "$(od -An -tx1 -j18 -N2 {{ config_root }}/.build/stage/bao | tr -d ' ')" = "3e00" || { echo 'staged bao is not an x86-64 ELF' >&2; exit 1; }""",
+	"""echo "staged bao: $(bao version 2>/dev/null | head -1)" """,
+]
+
+[tasks.build]
+description = "Build the appliance image (needs root)"
+depends = ["stage"]
+run = '''
+set -eu
+mkdir -p "$OUT_DIR"
+rm -f "$IMAGE"
+
+# --partition is REQUIRED, not a preference: alpine-make-vm-image otherwise writes the filesystem
+#   straight onto the disk with no partition table, which boots fine under QEMU and is rejected at
+#   import, because DigitalOcean custom images must carry an MBR or GPT table.
+# --initfs-features drops the default "kms" and keeps "scsi virtio". Both of the latter are mandatory:
+#   CONFIG_VIRTIO_BLK and CONFIG_SCSI_VIRTIO are modules in linux-virt rather than builtins, so an
+#   initramfs without them cannot mount the root filesystem -- and CONFIG_SCSI_VIRTIO is what produces
+#   the /dev/disk/by-id/scsi-0DO_Volume_* path the Raft volume is mounted from.
+# --serial-console because DigitalOcean's recovery console and QEMU both attach to ttyS0. Without it a
+#   failed boot is a black rectangle with no way to read the panic.
+# `command -v` first, because sudo resets PATH and would not otherwise find a mise-managed tool.
+sudo "$(command -v alpine-make-vm-image)" \
+	--image-format qcow2 \
+	--image-size "{{ vars.image_size }}" \
+	--arch x86_64 \
+	--branch "{{ vars.alpine_branch }}" \
+	--mirror-uri "{{ vars.alpine_mirror }}" \
+	--boot-mode BIOS \
+	--partition \
+	--rootfs ext4 \
+	--kernel-flavor virt \
+	--initfs-features "scsi virtio" \
+	--serial-console \
+	--packages "$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "{{ config_root }}/image/packages" | tr '\n' ' ')" \
+	--fs-skel-dir "$BUILD_DIR/skel" \
+	--script-chroot \
+	"$IMAGE" \
+	"$BUILD_DIR/stage/setup.sh"
+
+# alpine-make-vm-image can fail without failing: its dependency install reports an apk error and still
+# returns zero. The first build of this repository exited 0, printed "built", and had written no file at
+# all. Assert the artifact, never the exit code.
+test -s "$IMAGE" || { echo "FATAL: build reported success and produced no image" >&2; exit 1; }
+size="$(stat -c %s "$IMAGE")"
+test "$size" -ge 209715200 || {
+	echo "FATAL: $IMAGE is $((size / 1024 / 1024)) MiB, too small to contain OpenBao" >&2
+	exit 1
+}
+sudo chown "$(id -u):$(id -g)" "$IMAGE"
+qemu-img info "$IMAGE" | sed 's/^/    /'
+'''
+
+[tasks.verify]
+description = "Assert the built image's contents without booting it"
+run = "sudo {{ config_root }}/scripts/verify-image {{ env.IMAGE }}"
+
+# Answers what no amount of reading the recipe can: whether extlinux's BIOS boot works, whether the
+# initramfs carries virtio, and whether AppArmor came up in the LSM stack rather than merely compiled in.
+# DigitalOcean boots Droplets in legacy BIOS mode, which is what this matches.
+[tasks.boot]
+description = "Boot the image under QEMU on a serial console"
+usage = '''
+flag "--disk-size <size>" help="Resize a scratch copy first, to exercise root expansion" default=""
+flag "--seconds <seconds>" help="How long to run before terminating" default="240"
+'''
+run = '''
+set -eu
+test -f "$IMAGE" || { echo "no image; run mise run build" >&2; exit 1; }
+command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "qemu-system-x86_64 not found" >&2; exit 1; }
+
+work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+cp "$IMAGE" "$work/disk.qcow2"
+if [ -n "{{ flag(name='disk-size') }}" ]; then
+	qemu-img resize "$work/disk.qcow2" "{{ flag(name='disk-size') }}"
+fi
+
+timeout "{{ flag(name='seconds') }}" qemu-system-x86_64 \
+	-machine q35 -m 1024 -smp 2 \
+	-drive "file=$work/disk.qcow2,format=qcow2,if=virtio" \
+	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+	-nographic -display none -serial "file:$work/boot.log" >/dev/null 2>&1 || true
+
+echo "=== AppArmor, services, OpenBao ==="
+grep -iE "AppArmor|expand_root|TLS material|Starting|\[ !! \]" "$work/boot.log" | head -30
+'''
+
+[tasks.compress]
+description = "Compress the image for upload (bzip2, which DigitalOcean accepts)"
+sources = ["{{ config_root }}/out/{{ vars.image_name }}.qcow2"]
+outputs = ["{{ config_root }}/out/{{ vars.image_name }}.qcow2.bz2"]
+run = [
+	"bzip2 --keep --force --best {{ env.IMAGE }}",
+	"ls -lh {{ env.IMAGE }}.bz2",
+]
+
+# `doctl compute image create` takes ONLY --image-url. There is no file upload in the API, so the
+# artifact has to sit somewhere DigitalOcean's fetcher can reach with an unauthenticated GET first.
+# Publishing it as an OCI artifact does not work and was the original plan: registry blobs need a token
+# handshake even when public, and DigitalOcean's importer does not perform one.
+[tasks.import]
+description = "Register a published image URL as a DigitalOcean custom image"
+usage = '''
+arg "<url>" help="Publicly fetchable URL of the compressed image"
+flag "--name <name>" help="Custom image name" default="openbao-appliance"
+flag "--region <region>" help="DigitalOcean region" default="lon1"
+'''
+run = [
+	'''test -n "${DIGITALOCEAN_TOKEN:-}" || { echo "set DIGITALOCEAN_TOKEN" >&2; exit 1; }''',
+	"doctl compute image create '{{ flag(name='name') }}' --image-url '{{ arg(name='url') }}' --region '{{ flag(name='region') }}' --image-distribution Alpine --tag-names transitboard,transitboard-openbao",
+	'''echo 'Custom images bill at $0.06/GiB/month and nothing prunes old ones: doctl compute image list-user' ''',
+]
+
+# Proves the [tools] binary and the container image stack pins are the same bytes. Not part of the build:
+# it needs Docker, and it answers a question that only matters while both exist.
+[tasks."compare-upstream"]
+description = "Compare mise's bao against the binary in stack's pinned distroless image"
+run = '''
+set -eu
+image="docker.io/openbao/openbao-distroless@sha256:03a477a399bc406d61c67b50d8864dd3cbd72ed9ff328e9f0a53c21daa28c6c2"
+c="$(docker create --platform linux/amd64 "$image")"
+trap 'docker rm -f "$c" >/dev/null 2>&1 || true' EXIT
+docker export "$c" | tar -xO usr/bin/bao > /tmp/bao-from-image
+echo "  container: $(sha256sum /tmp/bao-from-image | cut -d' ' -f1)"
+echo "  mise:      $(sha256sum "$(command -v bao)" | cut -d' ' -f1)"
+'''
+
+[tasks.lint]
+description = "Shellcheck the runtime scripts the image ships"
+run = "shellcheck --shell=sh --severity=warning scripts/verify-image image/setup.sh image/overlay/etc/init.d/* image/overlay/usr/local/sbin/openbao-selfcheck"
+
+[tasks.clean]
+description = "Remove build outputs and staging"
+run = "rm -rf {{ config_root }}/out {{ config_root }}/.build"

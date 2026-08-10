@@ -1,0 +1,146 @@
+#!/bin/sh
+# Offline assertions against a built image: mounts the qcow2 through qemu-nbd and checks everything that
+# can be checked without booting. Needs root, for the same reason the build does.
+#
+# The division of labour is deliberate: this catches build mistakes in seconds, so a boot test is spent
+# only on the things that genuinely need a running kernel -- whether BIOS boot works, whether the
+# initramfs carries virtio, whether AppArmor came up enforcing.
+set -eu
+
+# The image to check, passed by the `verify` mise task. Its dependencies (qemu-nbd, sfdisk, losetup)
+# come from [bootstrap.packages] rather than being installed here -- this runs natively on the build
+# host now, not inside a container it could apk into.
+IMAGE="${1:?usage: verify-image <image.qcow2>}"
+test -f "$IMAGE" || { echo "no image at $IMAGE; run mise run build" >&2; exit 1; }
+
+fail=0
+check() {
+	if eval "$2" >/dev/null 2>&1; then
+		printf '  ok    %s\n' "$1"
+	else
+		printf '  FAIL  %s\n' "$1"
+		fail=1
+	fi
+}
+
+echo "==> image container"
+check "qcow2 format" "qemu-img info '$IMAGE' | grep -q 'file format: qcow2'"
+
+modprobe nbd max_part=8 2>/dev/null || true
+nbd=/dev/nbd0
+qemu-nbd --connect="$nbd" --format=qcow2 "$IMAGE"
+trap 'umount /mnt/img 2>/dev/null || true; losetup -D 2>/dev/null || true; qemu-nbd --disconnect "$nbd" >/dev/null 2>&1 || true' EXIT
+sleep 2
+
+# DigitalOcean rejects an image with no partition table, and alpine-make-vm-image writes the filesystem
+# straight onto the disk unless --partition is passed -- which boots fine under QEMU and fails at
+# import. Checked against the connected block device rather than the image file, because neither fdisk
+# nor sfdisk can read a qcow2: an earlier version of this check ran against the path and reported a
+# failure for an image that was correct.
+check "has a GPT partition table" "sfdisk -l '$nbd' 2>/dev/null | grep -q 'Disklabel type: gpt'"
+
+# /dev/nbd0p1 is deliberately not used. Partition scanning for nbd is a module load-time parameter, so
+# on a host where something has already loaded nbd without max_part the partition devices never appear
+# and there is no way to ask for them afterwards. Reading the partition's start sector and mounting at
+# that offset works either way and depends on nothing outside this script.
+start_sector="$(sfdisk --json "$nbd" | tr -d ' "' | sed -n 's/^start:\([0-9]*\),*$/\1/p' | head -1)"
+test -n "$start_sector" || { echo "could not read the root partition's start sector" >&2; exit 1; }
+loop="$(losetup --find --show --read-only --offset "$((start_sector * 512))" "$nbd")"
+
+mkdir -p /mnt/img
+mount -o ro "$loop" /mnt/img
+R=/mnt/img
+
+# The package record, copied out while the image happens to be mounted. It is the only description of
+# what is installed once apk has been removed from the image, so it belongs beside the artifact rather
+# than only inside it -- the release notes publish it, and an operator can read it without mounting
+# anything.
+cp "$R/etc/openbao-appliance-packages" "$(dirname "$IMAGE")/packages.txt" 2>/dev/null || true
+
+echo "==> boot"
+# The check this whole image most depends on. AppArmor is compiled into linux-virt but left out of
+# CONFIG_LSM, so without both of these on the kernel command line the profile below loads and confines
+# nothing, with no error anywhere.
+check "apparmor=1 on cmdline"     "grep -q 'apparmor=1' $R/boot/extlinux.conf"
+check "apparmor in lsm= list"     "grep -qE 'lsm=[^ ]*apparmor' $R/boot/extlinux.conf"
+# Asserted because setup.sh rewrites the kernel command line, and the obvious way to do that
+# (replacing default_kernel_opts outright) drops the console= that --serial-console added.
+check "serial console on cmdline" "grep -qE 'console=ttyS0' $R/boot/extlinux.conf"
+check "kernel present"            "ls $R/boot/vmlinuz-virt"
+check "initramfs present"         "ls $R/boot/initramfs-virt"
+check "memory zeroing enabled"    "grep -q 'init_on_free=1' $R/boot/extlinux.conf"
+
+echo "==> OpenBao"
+check "binary installed"          "test -x $R/usr/sbin/bao"
+check "binary is root-owned"      "[ \"\$(stat -c %u $R/usr/sbin/bao)\" = 0 ]"
+check "config present"            "test -f $R/etc/openbao/openbao.hcl"
+# The point of the appliance. If this string comes back, mlock is off and the image is no better than
+# the container it replaces.
+check "disable_mlock absent"      "! grep -qE '^[^#]*disable_mlock' $R/etc/openbao/openbao.hcl"
+check "audit device declared"     "grep -q 'audit \"file\"' $R/etc/openbao/openbao.hcl"
+check "openbao user is 65532"     "grep -q '^openbao:x:65532:' $R/etc/passwd"
+check "openbao user has nologin"  "grep '^openbao:' $R/etc/passwd | grep -q nologin"
+
+echo "==> confinement"
+check "apparmor profile present"  "test -f $R/etc/apparmor.d/openbao"
+check "profile grants ipc_lock"   "grep -q 'capability ipc_lock' $R/etc/apparmor.d/openbao"
+check "abstractions installed"    "test -f $R/etc/apparmor.d/abstractions/base"
+check "ambient cap requested"     "grep -q 'capabilities=\"\\^cap_ipc_lock\"' $R/etc/init.d/openbao"
+check "no_new_privs requested"    "grep -q 'no_new_privs=\"yes\"' $R/etc/init.d/openbao"
+
+echo "==> attack surface"
+# Measured rather than asserted: these are the numbers that justify the appliance over a Debian node,
+# and they should be visible on every build rather than quoted from a conversation.
+# awk rather than `grep -c`, which exits non-zero on a count of zero and made the `|| echo 0` fallback
+# fire on top of its own output -- printing "0" twice and hiding that the record was empty.
+packages="$(awk '!/^[[:space:]]*#/ && NF' "$R/etc/openbao-appliance-packages" 2>/dev/null | wc -l)"
+setuid="$(find $R -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | wc -l)"
+echo "  packages installed: $packages"
+echo "  setuid/setgid binaries: $setuid"
+check "no package manager"        "! test -e $R/sbin/apk"
+# The record is the only description of what is on a node with no package manager. An empty one is a
+# build failure, not a cosmetic gap.
+check "package record populated"  "[ \"$packages\" -gt 50 ]"
+check "no setuid binaries"        "[ \"$setuid\" -eq 0 ]"
+check "no interpreters"           "! ls $R/usr/bin/python3* $R/usr/bin/perl 2>/dev/null | grep -q ."
+check "root password locked"      "grep '^root:' $R/etc/shadow | grep -qE '^root:[!*]'"
+
+# Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names
+# point at. `mount` is the one that matters -- OpenRC cannot mount /run without it and gives up before
+# starting anything -- but the whole directory is cheap to check and the next removal might hit
+# something else. Symlinks are resolved against the image root, not the host's.
+dangling="$(find $R/bin $R/sbin $R/usr/bin $R/usr/sbin -type l 2>/dev/null | while read -r l; do
+	t="$(readlink "$l")"; case "$t" in /*) t="$R$t";; *) t="$(dirname "$l")/$t";; esac
+	[ -e "$t" ] || echo "$l"
+done)"
+check "no dangling symlinks"      "[ -z \"$dangling\" ]"
+[ -z "$dangling" ] || echo "$dangling" | sed "s|$R|    |"
+# Resolved against the image root rather than followed. /bin/mount is a symlink to the absolute path
+# /bin/bbsuid, so `test -e` on it asks about the HOST's /bin/bbsuid and answers a question nobody asked.
+check "mount resolves in-image"   "test -x $R\$(readlink $R/bin/mount)"
+
+echo "==> services"
+# `test -L`, not `ls`. Runlevel entries are symlinks to absolute paths (/etc/init.d/openbao), so they
+# dangle whenever the image is mounted anywhere other than / -- and `ls` treats a dangling symlink as an
+# error. An earlier version used `ls` and reported every service as missing on an image where all of
+# them were correctly enabled.
+for s in apparmor tiny-cloud-boot; do
+	check "$s enabled at boot"    "test -L $R/etc/runlevels/boot/$s"
+done
+for s in openbao sshd chronyd tiny-cloud-main openbao-pod-routes; do
+	check "$s enabled by default" "test -L $R/etc/runlevels/default/$s"
+done
+
+echo "==> ssh"
+# Turning this off is the most plausible well-intentioned change that would break operations entirely,
+# so it is asserted rather than left to review.
+check "tcp forwarding allowed"    "grep -q '^AllowTcpForwarding yes' $R/etc/ssh/sshd_config.d/10-appliance.conf"
+check "password auth disabled"    "grep -q '^PasswordAuthentication no' $R/etc/ssh/sshd_config.d/10-appliance.conf"
+
+echo
+if [ "$fail" -ne 0 ]; then
+	echo "FAILED"
+	exit 1
+fi
+echo "All offline checks passed. Boot it before believing any of the runtime properties:"
+echo "  mise run boot"

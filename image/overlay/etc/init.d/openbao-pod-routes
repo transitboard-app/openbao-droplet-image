@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # openrc-run reads these variables out of this file; nothing here uses
+# them directly, so shellcheck cannot see the consumer.
+# Routes back to each Kubernetes worker node's pod range.
+#
+# The OpenRC equivalent of the systemd unit stack's scripts/reconcile-openbao-routes installs, and the
+# reason this appliance needs one at all. D20: a pod's packet reaches OpenBao because the firewall
+# admits the cluster's pod CIDR, but the reply is sent to the PUBLIC default gateway and dropped unless
+# this Droplet has a route back via the worker node that owns that slice of the range. Cilium gives each
+# node its own slice, so this is one route per node, not per cluster.
+#
+# The symptom of it being missing is total and misleading: pods on a node without a route cannot start,
+# every other pod is fine, and the Agent sidecar reports an i/o timeout that reads as OpenBao being down.
+#
+# /etc/openbao/pod-routes is written by the operator (or by stack's reconcile task) as one
+# "<pod-cidr> <node-private-address>" pair per line.
+
+description="Routes from this node back to Kubernetes pod ranges"
+
+depend() {
+	need net
+	before openbao
+}
+
+start() {
+	[ -f /etc/openbao/pod-routes ] || {
+		einfo "No /etc/openbao/pod-routes; nothing to install"
+		return 0
+	}
+	ebegin "Installing pod routes"
+	while read -r cidr next_hop; do
+		case "$cidr" in ''|\#*) continue ;; esac
+		# `replace` rather than `add`, so re-running is not an error. busybox's ip applet does not
+		# implement replace, which is why iproute2 is in the package list.
+		ip route replace "$cidr" via "$next_hop" || return 1
+	done < /etc/openbao/pod-routes
+	eend $?
+}

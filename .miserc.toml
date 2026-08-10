@@ -1,0 +1,9 @@
+# `auto_env` is what makes mise.linux-x64.toml load without MISE_ENV being set by hand: mise recognises
+# platform environments (linux-x64, macos-arm64, ...) and selects the matching config.
+#
+# Declared here rather than inherited from stack's own .miserc.toml, because this directory is a
+# placeholder for a repository that will stand on its own. Without it, a checkout outside stack would
+# find no configuration at all -- there is deliberately no plain mise.toml to fall back to.
+#
+# mise 2026.8.3 defaults this off; it becomes the default in 2027.6.0.
+auto_env = true

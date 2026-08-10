@@ -1,0 +1,127 @@
+name: Build and release the appliance image
+
+# Manually triggered, deliberately. This image is the boot medium for the machine holding every
+# production credential; it is released when someone decides to release it, not when a branch moves.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, CalVer YYYY.MM.DD.N (for example 2026.08.10.1)"
+        required: true
+        type: string
+      boot_test:
+        description: "Boot the image under QEMU before releasing it"
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a prerelease"
+        type: boolean
+        default: false
+
+# Only what creating a release needs.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # ubuntu-24.04 rather than ubuntu-latest, so the build host is a decision rather than whatever
+    # GitHub promoted this month. The build needs a Linux kernel with ext4 and root; it does NOT need an
+    # Alpine host, because alpine-make-vm-image downloads checksum-verified static apk-tools on anything
+    # that is not Alpine.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      # mise refuses to load an untrusted config, and a fresh runner trusts nothing.
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # The tag is what the release is named and what a future operator reads in a deploy diff, so it is
+      # checked before anything expensive happens rather than at the last step. Four segments is CalVer,
+      # matching the convention stack uses for every published image.
+      - name: Check the tag format
+        run: |
+          if ! printf '%s' "${{ inputs.tag }}" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$'; then
+            echo "::error::'${{ inputs.tag }}' is not CalVer YYYY.MM.DD.N (for example 2026.08.10.1)"
+            exit 1
+          fi
+          if gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::${{ inputs.tag }} already exists. Never move a published tag; cut a new one."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # Installs everything in [tools]: OpenBao's binary and alpine-make-vm-image, both checksum-pinned.
+      # It reads mise.linux-x64.toml, which .miserc.toml's `auto_env = true` selects on a linux-x64 host.
+      - uses: jdx/mise-action@v4
+
+      - name: Install system packages
+        run: mise bootstrap packages apply --yes
+
+      # `verify` mounts the built image through qemu-nbd, and the module is not loaded on a fresh runner.
+      # Loading it here rather than inside the task keeps the task honest about needing a host that can.
+      - name: Load nbd
+        run: sudo modprobe nbd max_part=8
+
+      - name: Build
+        run: mise run build
+
+      - name: Verify
+        run: mise run verify
+
+      # The check that catches anything which breaks the boot rather than the contents -- deleting a
+      # binary that other names point at, for instance, which offline verification cannot see.
+      #
+      # /dev/kvm is not reliably present on GitHub-hosted runners, so this usually runs under TCG and
+      # takes a few minutes. That is worth paying on a manual release; the input exists for when it is
+      # not.
+      - name: Boot test
+        if: ${{ inputs.boot_test }}
+        run: mise run boot --seconds 300
+
+      - name: Compress
+        run: mise run compress
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          artifact=out/openbao-appliance.qcow2.bz2
+          checksum="$(sha256sum "$artifact" | cut -d' ' -f1)"
+
+          # The notes carry what an operator needs before booting a Droplet from this: the checksum to
+          # verify what they downloaded, and the package set, which is the only description of the
+          # image's contents once apk has been removed from it.
+          {
+            echo "Alpine appliance image for the Transitboard OpenBao Droplets."
+            echo
+            echo '```'
+            echo "sha256  $checksum"
+            echo "size    $(du -h "$artifact" | cut -f1)"
+            echo '```'
+            echo
+            echo "Import it with \`mise run import <url>\` once the asset is reachable by an"
+            echo "unauthenticated GET. **A private repository's release assets are not**, and"
+            echo "DigitalOcean's importer performs no token handshake."
+            echo
+            echo "<details><summary>Installed packages</summary>"
+            echo
+            echo '```'
+            cat out/packages.txt 2>/dev/null || echo "(not recorded)"
+            echo '```'
+            echo "</details>"
+          } > notes.md
+
+          args=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then args="--prerelease"; fi
+
+          # shellcheck disable=SC2086
+          gh release create "${{ inputs.tag }}" "$artifact" \
+            --title "${{ inputs.tag }}" \
+            --notes-file notes.md \
+            --target "${{ github.sha }}" \
+            $args

@@ -1,0 +1,50 @@
+# Everything installed into the appliance beyond `alpine-base` and the `linux-virt` kernel.
+#
+# The rule for this file: a package earns its place by being needed to boot on DigitalOcean, to reach
+# the node, or to run and confine OpenBao. Nothing here is for convenience -- there is no shell to be
+# convenient in and no package manager to add one with once the image is built.
+#
+# Blank lines and # comments are stripped by scripts/build-image.
+
+# Break-glass access, and the transport for both of stack's tunnels. `openbao:tunnel` and `db:tunnel`
+# are `ssh -L` port forwards through this node, so sshd is load-bearing operations tooling rather than
+# a convenience -- see the AllowTcpForwarding note in overlay/etc/ssh/sshd_config.d/10-appliance.conf.
+openssh
+
+# DigitalOcean's metadata contract: SSH keys, hostname, networking, root filesystem expansion.
+# tiny-cloud rather than cloud-init, measured at 5 MiB against 62 MiB -- cloud-init drags in a whole
+# Python runtime, which on this machine is both the largest single package and the largest interpreter
+# an attacker could find already installed.
+tiny-cloud-digitalocean
+tiny-cloud-openrc
+
+# Mandatory access control for the OpenBao process. See overlay/etc/apparmor.d/openbao, and the kernel
+# command line in setup.sh without which none of it takes effect.
+apparmor
+apparmor-openrc
+# The abstractions and tunables the profile includes. Not part of the `apparmor` package, and their
+# absence is a parse error at boot rather than a missing feature. 668 KiB.
+apparmor-profiles-abstractions
+apparmor-profiles-tunables
+
+# getpcaps, used by the boot-time self-check to prove OpenBao actually holds CAP_IPC_LOCK rather than
+# merely having been asked to.
+libcap-utils
+
+# resize2fs and sfdisk, for growing the root filesystem into the Droplet's disk on first boot. The
+# image is 1 GiB and the smallest Droplet has 25 GiB.
+e2fsprogs-extra
+sfdisk
+
+# OpenBao dials the managed PostgreSQL instance over TLS to mint leased logins, and verifies its
+# certificate against these.
+ca-certificates
+
+# Clock discipline. Not optional on this host specifically: every credential OpenBao issues is a
+# time-bounded lease, and its own TLS handshakes fail on skew. A secret server with a drifting clock
+# fails in ways that read as authentication bugs.
+chrony
+
+# `ip route replace`, which busybox's applet does not implement. stack's D20 fix writes one route per
+# worker node onto this Droplet; without it, pods reach OpenBao and the replies are dropped.
+iproute2

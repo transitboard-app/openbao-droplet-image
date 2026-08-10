@@ -1,0 +1,101 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # openrc-run reads these variables out of this file; nothing here uses
+# them directly, so shellcheck cannot see the consumer.
+# OpenBao, supervised, confined, and holding its memory locked.
+#
+# This replaces the systemd unit in stack/infrastructure/platform/cloud-init.yaml.tftpl. Every guard in
+# that unit is reproduced here, because each one was added in response to something that actually went
+# wrong; where the mechanism differs, the comment says so.
+
+name="OpenBao"
+description="OpenBao secret control plane"
+
+command="/usr/sbin/bao"
+command_args="server -config=/etc/openbao/openbao.hcl"
+command_user="openbao:openbao"
+
+supervisor="supervise-daemon"
+supervise_daemon_args="--stdout /var/log/openbao/stdout.log --stderr /var/log/openbao/stderr.log"
+
+# The whole reason this appliance exists rather than a container.
+#
+# `^cap_ipc_lock` is cap_iab(3) notation: the caret puts CAP_IPC_LOCK in the ambient set, so it survives
+# the drop to uid 65532 and the exec into a non-root process. That is what lets OpenBao mlock its
+# memory, and it is why the shipped openbao.hcl carries no `disable_mlock` -- the container arrangement
+# this replaces could not do it at all, because a file capability on a distroless binary running as a
+# non-root user never reaches the process.
+#
+# Ambient capabilities and no_new_privs coexist; file capabilities and no_new_privs do not. Using setcap
+# here instead would have produced a process with neither the capability nor an error message.
+capabilities="^cap_ipc_lock"
+no_new_privs="yes"
+
+# CAP_IPC_LOCK bypasses RLIMIT_MEMLOCK, so this is belt and braces rather than load-bearing -- but if
+# the ambient capability ever fails to apply, an unlimited memlock is the difference between OpenBao
+# locking its memory and OpenBao logging a warning and carrying on unlocked.
+rc_ulimit="-l unlimited -n 65536"
+
+depend() {
+	need net localmount
+	after tiny-cloud-main chronyd apparmor
+}
+
+start_pre() {
+	# The TLS gate. Equivalent to ConditionPathExists= on the systemd unit: refuse to start rather than
+	# restart-loop against material the operator has not installed yet. Returning 1 here makes OpenRC
+	# report a clean failure with this message, which is what the operator needs to see on first boot.
+	if [ ! -f /etc/openbao/tls/server.crt ] || [ ! -f /etc/openbao/tls/server.key ]; then
+		eerror "No TLS material in /etc/openbao/tls."
+		eerror "Generate it with stack's scripts/generate-openbao-tls <node-private-address>,"
+		eerror "copy server.crt, server.key and ca.crt here owned by uid 65532, then start again."
+		return 1
+	fi
+
+	# The Raft volume, mounted on demand rather than from fstab.
+	#
+	# This is the trap the systemd unit solved with noauto + RequiresMountsFor, and it is worth
+	# restating because getting it wrong is silent and destroys the store: the DigitalOcean volume is
+	# attached by a separate API call that cannot run until the Droplet exists, so at first boot the
+	# device is genuinely absent. Mounting from fstab at boot fails; NOT mounting at all is worse,
+	# because OpenBao then writes its Raft store to the Droplet's own disk while the attached volume
+	# sits empty and nothing says so.
+	#
+	# So: mount here, and refuse to start if it cannot be mounted.
+	if ! mountpoint -q /var/lib/openbao; then
+		device="${RAFT_DEVICE:-}"
+		if [ -z "$device" ]; then
+			# One volume per node, so exactly one match is the expected case. Zero or several is a
+			# situation for an operator, not for a guess about which disk holds the secrets.
+			set -- /dev/disk/by-id/scsi-0DO_Volume_*
+			if [ "$#" -eq 1 ] && [ -b "$1" ]; then
+				device="$1"
+			else
+				eerror "Expected exactly one DigitalOcean volume, found $#."
+				eerror "Set RAFT_DEVICE in /etc/conf.d/openbao to choose explicitly."
+				return 1
+			fi
+		fi
+
+		ebegin "Mounting Raft volume $device"
+		mount -t ext4 -o defaults,noatime "$device" /var/lib/openbao
+		eend $? "Could not mount the Raft volume; refusing to start on the Droplet's own disk" || return 1
+	fi
+
+	# Ownership is applied after the mount, not before: it has to land on the mounted filesystem rather
+	# than on the empty directory underneath it. Idempotent, so this is safe on every start.
+	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao
+	install -d -o 65532 -g 65532 -m 0700 /var/log/openbao
+
+	# The address clients dial. Not templated into the image, because it is this node's own private
+	# address and the image is built long before any node exists. The private interface is deliberate:
+	# the firewall admits 8200 only from tagged Droplets and the cluster pod ranges, so the public
+	# address is not a path anything can use.
+	address="$(wget -qO- -T 5 http://169.254.169.254/metadata/v1/interfaces/private/0/ipv4/address 2>/dev/null || true)"
+	if [ -z "$address" ]; then
+		eerror "Could not read this node's private address from the metadata service."
+		return 1
+	fi
+	export BAO_API_ADDR="https://${address}:8200"
+	export BAO_CLUSTER_ADDR="https://${address}:8201"
+}

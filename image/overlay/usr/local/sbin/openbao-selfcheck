@@ -1,0 +1,67 @@
+#!/bin/sh
+# Asserts that the properties this image claims are true of the running system.
+#
+# Every check here exists because the corresponding configuration can be present and ineffective. The
+# kernel can carry an AppArmor profile that was never enforced; the init script can request an ambient
+# capability the kernel declined to grant; mlock can be configured and silently not held. Configuration
+# is a claim, and this is the part that checks it.
+#
+# Exits non-zero on the first failure so it can gate anything that depends on the node being sound.
+set -eu
+
+fail=0
+check() {
+	if eval "$2" >/dev/null 2>&1; then
+		printf '  ok    %s\n' "$1"
+	else
+		printf '  FAIL  %s\n' "$1"
+		fail=1
+	fi
+}
+
+# securityfs carries AppArmor's state and is not always mounted by default. Mounting it here rather
+# than depending on it keeps this script runnable on a node where something else did not.
+[ -d /sys/kernel/security/apparmor ] || mount -t securityfs securityfs /sys/kernel/security 2>/dev/null || true
+
+echo "AppArmor"
+# Read from the kernel directly rather than through aa-status. That tool lives in apparmor-utils, which
+# is not installed -- and asking the kernel is the better check anyway: it reports what is actually
+# enforced rather than what a userspace tool believes was loaded.
+check "enabled in the kernel"        '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = "Y" ]'
+check "openbao profile loaded"       'grep -q "^openbao " /sys/kernel/security/apparmor/profiles'
+check "profile is enforcing"         'grep -q "^openbao (enforce)" /sys/kernel/security/apparmor/profiles'
+
+echo "OpenBao process"
+pid="$(pgrep -x bao 2>/dev/null | head -1 || true)"
+check "running"                      '[ -n "'"$pid"'" ]'
+if [ -n "$pid" ]; then
+	# The one that matters most. VmLck is the number of kilobytes this process has locked into RAM; a
+	# zero here means mlock did not happen and secret material can reach swap, regardless of what the
+	# configuration says.
+	check "memory locked (VmLck > 0)" '[ "$(awk "/VmLck/ {print \$2}" /proc/'"$pid"'/status)" -gt 0 ]'
+	check "holds CAP_IPC_LOCK"        'getpcaps '"$pid"' 2>&1 | grep -q ipc_lock'
+	check "runs as uid 65532"         '[ "$(awk "/^Uid:/ {print \$2}" /proc/'"$pid"'/status)" = "65532" ]'
+	check "no_new_privs set"          '[ "$(awk "/^NoNewPrivs:/ {print \$2}" /proc/'"$pid"'/status)" = "1" ]'
+	# The confinement label of this specific process, which is the question the profile existing does
+	# not answer: a loaded profile that never attached leaves OpenBao unconfined with nothing to say so.
+	check "confined by openbao profile" 'grep -q "^openbao (enforce)" /proc/'"$pid"'/attr/current'
+fi
+
+echo "Host"
+check "no swap active"               '[ "$(awk "NR>1" /proc/swaps | wc -l)" -eq 0 ]'
+check "core dumps discarded"         'grep -q "/bin/false" /proc/sys/kernel/core_pattern'
+check "ptrace_scope is 3"            '[ "$(cat /proc/sys/kernel/yama/ptrace_scope)" = "3" ]'
+check "raft volume mounted"          'mountpoint -q /var/lib/openbao'
+check "no package manager"           '! command -v apk'
+check "no shell for openbao user"    'grep "^openbao:" /etc/passwd | grep -q nologin'
+
+echo "AppArmor denials since boot"
+if dmesg 2>/dev/null | grep -q 'apparmor="DENIED"'; then
+	echo "  denials recorded -- the profile is too tight somewhere:"
+	dmesg | grep 'apparmor="DENIED"' | tail -10 | sed 's/^/    /'
+	fail=1
+else
+	echo "  none"
+fi
+
+exit "$fail"

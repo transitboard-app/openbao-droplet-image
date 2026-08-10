@@ -1,0 +1,7 @@
+# Build outputs.
+out/
+
+# The verified OpenBao binary, 186 MiB and reproducible from OPENBAO_IMAGE at any time. Cached rather
+# than committed: mise run fetch-bao refuses to use a copy whose checksum does not match BAO_SHA256, so
+# there is nothing a committed copy would protect that the pin does not already.
+.cache/

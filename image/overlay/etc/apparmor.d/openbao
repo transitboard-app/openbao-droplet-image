@@ -1,0 +1,77 @@
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# Mandatory access control for OpenBao.
+#
+# This is the layer that replaces what podman was providing on the Debian nodes -- `--read-only`,
+# `--cap-drop ALL` and a filesystem containing nothing but the binary. AppArmor gives a stricter version
+# of all three, because it constrains the process rather than the container around it.
+#
+# Read this profile as a whitelist: anything not granted below is denied, including every exec. There is
+# deliberately no `x` rule of any kind, so a code-execution bug in OpenBao cannot start a shell -- and
+# there is no shell on the appliance for it to start, which is the belt to this profile's braces.
+#
+# NOTE: none of this takes effect unless the kernel booted with apparmor in the LSM stack. linux-virt
+# compiles AppArmor in but leaves it out of CONFIG_LSM, so `apparmor=1 lsm=...,apparmor` on the kernel
+# command line is what makes this file real. image/setup.sh sets it and asserts it reached
+# /boot/extlinux.conf; openbao-selfcheck asserts the running process is genuinely confined.
+profile openbao /usr/sbin/bao flags=(attach_disconnected) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+  include <abstractions/ssl_certs>
+
+  # The one capability this process is allowed to hold, granted ambiently by the init script so that
+  # OpenBao can mlock its memory. Everything else is denied by omission.
+  capability ipc_lock,
+
+  # The API on 8200 and Raft on 8201, plus outbound connections to the managed PostgreSQL instance
+  # whose logins OpenBao mints.
+  network inet stream,
+  network inet6 stream,
+
+  /usr/sbin/bao mr,
+
+  # Configuration and TLS material. Read-only: OpenBao has no business rewriting its own config, and
+  # the private key should be unreachable for writing even to the process that uses it.
+  /etc/openbao/ r,
+  /etc/openbao/** r,
+
+  # The Raft store. `k` grants file locking, which the storage backend needs and whose absence shows up
+  # as a startup failure rather than as a permission error.
+  /var/lib/openbao/ rw,
+  /var/lib/openbao/** rwk,
+
+  # The audit log, on the Droplet's own disk rather than the Raft volume. OpenBao refuses requests when
+  # every audit device fails to write, so an audit log that filled the Raft volume would take the
+  # service down -- separate filesystems keep log growth from becoming an outage.
+  /var/log/openbao/ rw,
+  /var/log/openbao/** rwk,
+
+  # Go runtime and networking introspection. A static Go binary needs less than a dynamically linked
+  # one, but not nothing.
+  @{PROC}/sys/net/core/somaxconn r,
+  @{PROC}/sys/kernel/hostname r,
+  owner @{PROC}/@{pid}/maps r,
+  owner @{PROC}/@{pid}/status r,
+  owner @{PROC}/@{pid}/cgroup r,
+  owner @{PROC}/@{pid}/task/ r,
+  owner @{PROC}/@{pid}/task/** r,
+  /sys/kernel/mm/transparent_hugepage/hpage_pmd_size r,
+
+  # Explicit denials for things that would otherwise be caught by an abstraction, stated here so the
+  # intent survives an abstraction changing underneath us. `audit` makes an attempt visible in dmesg
+  # instead of silently refused, which is what you want from a probe at these paths.
+  audit deny /etc/shadow rwklx,
+  audit deny /root/** rwklx,
+  audit deny @{PROC}/*/mem rwklx,
+
+  # Exec, denied everywhere and unconditionally. There is no `x` grant anywhere above, so this is
+  # already implied -- it is stated to make the intent survive an abstraction being widened upstream.
+  #
+  # There is deliberately no matching `deny /** w` here, tempting as it looks. AppArmor resolves an
+  # explicit deny ahead of any allow regardless of specificity, so a blanket write denial would silently
+  # override the /var/lib/openbao grant above and OpenBao would fail to write its own Raft store. Denial
+  # by omission is what confines writes; the whitelist above is the complete set.
+  deny /** x,
+}
