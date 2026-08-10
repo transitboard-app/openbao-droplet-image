@@ -27,7 +27,10 @@ none. On macOS this directory has no tasks at all. Do not add a `mise.toml` to "
 | `scripts/verify-image` | offline assertions against a built image, and the package manifest |
 | `.github/workflows/` | the manual release pipeline |
 
-## The three things most likely to be got wrong
+## The things most likely to be got wrong
+
+Every one of these was got wrong here first, and three of the four looked correct until the image ran on
+a real Droplet. Local verification cannot reach them.
 
 **AppArmor is compiled in but not enabled by default.** `linux-virt` sets
 `CONFIG_SECURITY_APPARMOR=y` and ships
@@ -38,12 +41,23 @@ it fails silently. `image/setup.sh` sets it and asserts it reached `/boot/extlin
 `scripts/verify-image` asserts it again offline; `openbao-selfcheck` asserts the running process is
 genuinely confined. Do not remove any of the three.
 
-**Ambient capabilities, never `setcap`.** OpenBao gets `CAP_IPC_LOCK` from
-`capabilities="^cap_ipc_lock"` in its init script, which supervise-daemon applies as an *ambient*
-capability. A file capability would be the obvious alternative and is wrong twice over: it would modify
-a binary that is otherwise byte-identical to the digest-pinned one upstream published, and file
-capabilities are ignored under `no_new_privs`, so setting both would produce a process holding neither
-— with no error to say so.
+**OpenBao 2.x has dropped mlock, so do not reach for `CAP_IPC_LOCK`.** This image used to grant it
+ambiently and the AppArmor profile used to allow it, on the reasoning that mlock was the one thing the
+container arrangement structurally could not do. That reasoning is dead: `disable_mlock = false` is now
+a fatal configuration error (`OpenBao has dropped support for mlock … disable or encrypt swap
+instead`), and a Droplet with the grant fully applied — `CapAmb: 0000000000004000` — still showed
+`VmLck: 0`, because there is no longer any code in OpenBao to use it.
+
+What stands in its place is the absence of swap, which is upstream's own advice. That makes
+`no swap active` in `openbao-selfcheck` load-bearing rather than hygiene. Adding swap to this image
+would silently undo the property mlock used to provide.
+
+**The Raft volume is found through sysfs, not `/dev/disk/by-id`.** DigitalOcean documents
+`/dev/disk/by-id/scsi-0DO_Volume_<name>`, and it exists on their Debian and Ubuntu images because those
+run udev. This image runs `mdev`, which populates `by-label`, `by-uuid` and `by-partlabel` from blkid
+and leaves `by-id` **empty** — so the documented glob matched nothing on a Droplet whose volume was
+attached and healthy. `start_pre()` scans `/sys/block/sd*` for SCSI vendor `DO`, model `Volume`
+instead, and still refuses to guess unless there is exactly one match.
 
 **`deny` beats `allow` in AppArmor, regardless of specificity.** A blanket `deny /** w` in the profile
 would override the `/var/lib/openbao/** rwk` grant and OpenBao could not write its own Raft store.
@@ -67,7 +81,12 @@ nothing is granted exec anywhere.
 
 ## What is not settled
 
-- Whether the AppArmor profile is tight enough or too tight. It has not yet run against a real workload.
-  `openbao-selfcheck` reports denials since boot; that output is the input to the next revision.
-- The kernel command line carries no `lockdown=` and no `mitigations=` yet. Each can prevent boot, and
-  the image is not yet proven to boot at all. Add them one at a time, with a boot test each.
+- Whether the AppArmor profile is tight enough. It has now run against a real OpenBao serving on a
+  Droplet, which produced exactly one denial — `@{PROC}/@{pid}/mountinfo`, since granted — but that node
+  was sealed the whole time. Unsealing, PostgreSQL credential minting and Agent injection have not
+  exercised it yet. `openbao-selfcheck` reports denials since boot; that output is the next revision.
+- The kernel command line carries no `lockdown=` and no `mitigations=` yet. Each can prevent boot. Add
+  them one at a time, with a boot test each.
+- Nothing has read from OpenBao through this image yet. It boots, mounts its Raft volume, loads an
+  existing store and serves TLS on 8200; it has never been unsealed, so no client has completed a
+  request against it.

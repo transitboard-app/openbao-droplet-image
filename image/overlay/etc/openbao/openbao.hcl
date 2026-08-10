@@ -49,11 +49,16 @@ audit "file" {
   }
 }
 
-# There is deliberately no `disable_mlock` here, and its absence is the single clearest gain of this
-# appliance over the container it replaces.
+# There is deliberately no `disable_mlock` here, and the line must not come back in either direction.
 #
-# On the Debian nodes OpenBao ran as a non-root user inside a distroless image whose binary carried no
-# cap_ipc_lock, so granting the capability to the container could not reach the process and the config
-# had to set `disable_mlock = true`, with MemorySwapMax=0 standing in for the property mlock provides.
-# Here the init script grants CAP_IPC_LOCK ambiently, so OpenBao locks its memory for real, and
-# openbao-selfcheck asserts VmLck is non-zero rather than trusting that it did.
+# OpenBao 2.x has dropped mlock support outright. `disable_mlock = false` is not a no-op but a fatal
+# configuration error -- the server refuses to load and supervise-daemon respawns it to exhaustion:
+#
+#   error loading configuration from /etc/openbao/openbao.hcl: OpenBao has dropped support for mlock.
+#   Please remove the line "disable_mlock" = false from your config and disable or encrypt swap instead.
+#
+# `disable_mlock = true` is tolerated, which is why the Debian nodes carried it without complaint, but
+# it now describes a setting that does nothing. Absent is the only honest spelling, so absent it is.
+#
+# What replaces it is the absence of swap, which is upstream's own guidance. image/setup.sh configures
+# none and strips any fstab entry; openbao-selfcheck asserts /proc/swaps is empty on every run.

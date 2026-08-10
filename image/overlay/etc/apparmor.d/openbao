@@ -21,9 +21,9 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
   include <abstractions/nameservice>
   include <abstractions/ssl_certs>
 
-  # The one capability this process is allowed to hold, granted ambiently by the init script so that
-  # OpenBao can mlock its memory. Everything else is denied by omission.
-  capability ipc_lock,
+  # No `capability` rule of any kind, so the process may hold none. This granted `ipc_lock` until a live
+  # Droplet showed OpenBao 2.x has dropped mlock support entirely -- the capability reached the process
+  # and there was no longer any code in it to use them. See /etc/init.d/openbao.
 
   # The API on 8200 and Raft on 8201, plus outbound connections to the managed PostgreSQL instance
   # whose logins OpenBao mints.
@@ -55,6 +55,11 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
   owner @{PROC}/@{pid}/maps r,
   owner @{PROC}/@{pid}/status r,
   owner @{PROC}/@{pid}/cgroup r,
+  # Added after a live Droplet logged the only denial this profile has produced against a real OpenBao:
+  #   apparmor="DENIED" operation="open" name="/proc/3228/mountinfo" comm="bao" requested_mask="r"
+  # Reading its own mount table is how the storage backend learns what filesystem it is writing to. The
+  # `owner` qualifier keeps this to the process's own entry rather than every process on the host.
+  owner @{PROC}/@{pid}/mountinfo r,
   owner @{PROC}/@{pid}/task/ r,
   owner @{PROC}/@{pid}/task/** r,
   /sys/kernel/mm/transparent_hugepage/hpage_pmd_size r,

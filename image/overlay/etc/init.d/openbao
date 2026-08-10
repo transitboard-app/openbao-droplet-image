@@ -2,7 +2,7 @@
 # shellcheck shell=sh
 # shellcheck disable=SC2034  # openrc-run reads these variables out of this file; nothing here uses
 # them directly, so shellcheck cannot see the consumer.
-# OpenBao, supervised, confined, and holding its memory locked.
+# OpenBao, supervised and confined.
 #
 # This replaces the systemd unit in stack/infrastructure/platform/cloud-init.yaml.tftpl. Every guard in
 # that unit is reproduced here, because each one was added in response to something that actually went
@@ -18,23 +18,30 @@ command_user="openbao:openbao"
 supervisor="supervise-daemon"
 supervise_daemon_args="--stdout /var/log/openbao/stdout.log --stderr /var/log/openbao/stderr.log"
 
-# The whole reason this appliance exists rather than a container.
+# No capabilities at all, deliberately, and the history is worth keeping because it was wrong twice.
 #
-# `^cap_ipc_lock` is cap_iab(3) notation: the caret puts CAP_IPC_LOCK in the ambient set, so it survives
-# the drop to uid 65532 and the exec into a non-root process. That is what lets OpenBao mlock its
-# memory, and it is why the shipped openbao.hcl carries no `disable_mlock` -- the container arrangement
-# this replaces could not do it at all, because a file capability on a distroless binary running as a
-# non-root user never reaches the process.
+# This line used to read `capabilities="^cap_ipc_lock"` -- cap_iab(3) notation putting CAP_IPC_LOCK in
+# the ambient set, so it would survive the drop to uid 65532 and the exec into a non-root process. That
+# mechanism works exactly as documented: a Droplet running it showed `CapAmb: 0000000000004000`.
 #
-# Ambient capabilities and no_new_privs coexist; file capabilities and no_new_privs do not. Using setcap
-# here instead would have produced a process with neither the capability nor an error message.
-capabilities="^cap_ipc_lock"
+# It bought nothing. **OpenBao 2.x has dropped mlock support outright.** Starting it with
+# `disable_mlock = false` is a fatal configuration error in so many words:
+#
+#   OpenBao has dropped support for mlock. Please remove the line "disable_mlock" = false
+#   from your config and disable or encrypt swap instead.
+#
+# So the capability was delivered to a process containing no code that could use it, and `VmLck` stayed
+# at 0 on a node where every part of the grant had succeeded. Handing a long-lived network service the
+# ability to lock unlimited memory -- a denial-of-service primitive -- in exchange for nothing is a
+# straight loss, so it is gone.
+#
+# Upstream's own replacement guidance is "disable or encrypt swap", which image/setup.sh does: no swap
+# is configured, none is left in fstab, and openbao-selfcheck asserts /proc/swaps is empty at runtime.
 no_new_privs="yes"
 
-# CAP_IPC_LOCK bypasses RLIMIT_MEMLOCK, so this is belt and braces rather than load-bearing -- but if
-# the ambient capability ever fails to apply, an unlimited memlock is the difference between OpenBao
-# locking its memory and OpenBao logging a warning and carrying on unlocked.
-rc_ulimit="-l unlimited -n 65536"
+# File descriptors only. The `-l unlimited` that stood here existed to make mlock work even if the
+# ambient capability failed to apply, and has nothing left to do.
+rc_ulimit="-n 65536"
 
 depend() {
 	need net localmount
@@ -65,9 +72,31 @@ start_pre() {
 	if ! mountpoint -q /var/lib/openbao; then
 		device="${RAFT_DEVICE:-}"
 		if [ -z "$device" ]; then
+			# Ask the kernel what is attached, rather than asking udev.
+			#
+			# DigitalOcean documents the volume as /dev/disk/by-id/scsi-0DO_Volume_<name>, and that path
+			# is real -- on their Debian and Ubuntu images, where udev creates it. This image runs mdev,
+			# which builds /dev/disk/by-label, by-uuid and by-partlabel out of blkid and leaves
+			# /dev/disk/by-id EMPTY. Globbing it therefore matched nothing on a Droplet whose volume was
+			# attached and perfectly healthy. Neither of the directories mdev does populate helps: a
+			# DigitalOcean volume carries no filesystem label, and its UUID is made at create time, so
+			# an image built long beforehand cannot know it.
+			#
+			# sysfs has what is actually needed. A DigitalOcean block volume presents as SCSI vendor
+			# "DO", model "Volume"; the Droplet's own disk is virtio and appears as vda, so it is not a
+			# candidate and cannot be selected by accident.
+			#
 			# One volume per node, so exactly one match is the expected case. Zero or several is a
 			# situation for an operator, not for a guess about which disk holds the secrets.
-			set -- /dev/disk/by-id/scsi-0DO_Volume_*
+			set --
+			for sys in /sys/block/sd*; do
+				[ -e "$sys/device/vendor" ] || continue
+				read -r vendor < "$sys/device/vendor"
+				read -r model < "$sys/device/model"
+				case "$vendor" in DO) ;; *) continue ;; esac
+				case "$model" in Volume) ;; *) continue ;; esac
+				set -- "$@" "/dev/${sys##*/}"
+			done
 			if [ "$#" -eq 1 ] && [ -b "$1" ]; then
 				device="$1"
 			else

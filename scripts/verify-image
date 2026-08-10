@@ -74,8 +74,9 @@ echo "==> OpenBao"
 check "binary installed"          "test -x $R/usr/sbin/bao"
 check "binary is root-owned"      "[ \"\$(stat -c %u $R/usr/sbin/bao)\" = 0 ]"
 check "config present"            "test -f $R/etc/openbao/openbao.hcl"
-# The point of the appliance. If this string comes back, mlock is off and the image is no better than
-# the container it replaces.
+# Not a hardening preference any more but a boot gate: OpenBao 2.x rejects `disable_mlock = false` as a
+# fatal configuration error, and supervise-daemon respawns the failure until it gives up. Absent is the
+# only spelling that both loads and tells the truth. See the note in the config itself.
 check "disable_mlock absent"      "! grep -qE '^[^#]*disable_mlock' $R/etc/openbao/openbao.hcl"
 check "audit device declared"     "grep -q 'audit \"file\"' $R/etc/openbao/openbao.hcl"
 check "openbao user is 65532"     "grep -q '^openbao:x:65532:' $R/etc/passwd"
@@ -83,10 +84,24 @@ check "openbao user has nologin"  "grep '^openbao:' $R/etc/passwd | grep -q nolo
 
 echo "==> confinement"
 check "apparmor profile present"  "test -f $R/etc/apparmor.d/openbao"
-check "profile grants ipc_lock"   "grep -q 'capability ipc_lock' $R/etc/apparmor.d/openbao"
 check "abstractions installed"    "test -f $R/etc/apparmor.d/abstractions/base"
-check "ambient cap requested"     "grep -q 'capabilities=\"\\^cap_ipc_lock\"' $R/etc/init.d/openbao"
 check "no_new_privs requested"    "grep -q 'no_new_privs=\"yes\"' $R/etc/init.d/openbao"
+# Inverted from what these two asserted before. The image granted CAP_IPC_LOCK ambiently and the profile
+# allowed it, both so OpenBao could mlock -- until a live Droplet showed OpenBao 2.x has dropped mlock
+# support, leaving a network service holding a denial-of-service primitive it has no code to use. These
+# now assert the grant has not crept back.
+check "no capability granted"     "! grep -qE '^[^#]*capability ' $R/etc/apparmor.d/openbao"
+check "no ambient capabilities"   "! grep -qE '^[^#]*capabilities=' $R/etc/init.d/openbao"
+
+# The Raft volume is found through sysfs, never through /dev/disk/by-id. DigitalOcean documents the
+# by-id path and it is real on their udev-based images, but this appliance runs mdev, which leaves that
+# directory empty -- so the documented glob matched nothing on a Droplet whose volume was attached and
+# healthy, and OpenBao refused to start. Asserted here because the correct version is the less obvious
+# one and reads like a mistake.
+check "volume found via sysfs"    "grep -q '/sys/block/sd\\*' $R/etc/init.d/openbao"
+# Anchored past any `#`, because the comment above that code names the by-id path in order to explain
+# why it is not used -- and the first version of this check failed on that comment.
+check "no by-id volume glob"      "! grep -qE '^[^#]*disk/by-id' $R/etc/init.d/openbao"
 
 echo "==> attack surface"
 # Measured rather than asserted: these are the numbers that justify the appliance over a Debian node,

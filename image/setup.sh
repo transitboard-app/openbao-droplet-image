@@ -23,11 +23,10 @@ install -m 0755 -o root -g root /mnt/bao /usr/sbin/bao
 # the checksum of what actually shipped.
 install -m 0644 -o root -g root /mnt/provenance /etc/openbao-binary-provenance
 
-# Deliberately NOT setcap'd. CAP_IPC_LOCK is granted at start time as an *ambient* capability by
-# supervise-daemon (see /etc/init.d/openbao), which has two advantages over a file capability: the
-# binary is otherwise unmodified from upstream's, and ambient capabilities survive alongside
-# no_new_privs, which file capabilities do not -- setting both would have silently produced a process
-# with neither.
+# Deliberately NOT setcap'd, and now not granted any capability at all. This carried CAP_IPC_LOCK for
+# mlock until a live Droplet showed OpenBao 2.x has dropped mlock support; see /etc/init.d/openbao.
+# Leaving the binary untouched also keeps it byte-identical to upstream's apart from the strip recorded
+# above.
 
 install -d -o root -g root -m 0755 /etc/openbao
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /etc/openbao/tls
@@ -223,9 +222,9 @@ if [ -f /mnt/debug-password ]; then
 	MARKER
 fi
 
-# No swap is configured and none should be. CAP_IPC_LOCK plus mlock is the primary control (OpenBao's
-# `disable_mlock` is deliberately absent from the shipped config); the absence of swap is the backstop
-# for anything mlock does not cover.
+# No swap is configured and none should be. This is not a backstop but THE control: OpenBao 2.x has
+# dropped mlock, and upstream's replacement advice is exactly "disable or encrypt swap instead", so the
+# absence of swap is the only thing keeping decrypted secret material out of a disk-backed page.
 sed -i '/\bswap\b/d' /etc/fstab 2>/dev/null || true
 
 # Alpine's default motd advertises a general-purpose system. This is not one.

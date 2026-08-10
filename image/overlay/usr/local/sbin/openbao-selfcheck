@@ -32,22 +32,43 @@ check "openbao profile loaded"       'grep -q "^openbao " /sys/kernel/security/a
 check "profile is enforcing"         'grep -q "^openbao (enforce)" /sys/kernel/security/apparmor/profiles'
 
 echo "OpenBao process"
-pid="$(pgrep -x bao 2>/dev/null | head -1 || true)"
+# Found by walking /proc rather than with pgrep, because busybox's `pgrep -x bao` returns nothing on
+# this image for a process whose /proc/<pid>/comm is exactly `bao`, while plain `pgrep bao` finds it.
+#
+# That is worth more than a footnote. This block used to begin `pid="$(pgrep -x bao)"`, and on a live
+# Droplet serving requests on 8200 it reported one failure -- "running" -- and then SKIPPED every check
+# underneath it, because they were all guarded on a non-empty $pid. Silently skipping the confinement
+# and privilege assertions is the exact failure this script exists to prevent, so the guard below now
+# says so out loud instead of falling through quietly.
+pid=""
+for proc in /proc/[0-9]*; do
+	[ -r "$proc/comm" ] || continue
+	read -r comm < "$proc/comm" || continue
+	[ "$comm" = "bao" ] || continue
+	pid="${proc#/proc/}"
+	break
+done
 check "running"                      '[ -n "'"$pid"'" ]'
 if [ -n "$pid" ]; then
-	# The one that matters most. VmLck is the number of kilobytes this process has locked into RAM; a
-	# zero here means mlock did not happen and secret material can reach swap, regardless of what the
-	# configuration says.
-	check "memory locked (VmLck > 0)" '[ "$(awk "/VmLck/ {print \$2}" /proc/'"$pid"'/status)" -gt 0 ]'
-	check "holds CAP_IPC_LOCK"        'getpcaps '"$pid"' 2>&1 | grep -q ipc_lock'
+	# No capabilities, which is the correct assertion now that there is nothing to grant one for.
+	# OpenBao 2.x dropped mlock support, so the CAP_IPC_LOCK this once required -- and the
+	# `memory locked (VmLck > 0)` check that went with it -- are gone from the init script and from
+	# here. See /etc/init.d/openbao for the error message upstream emits and why the grant was removed
+	# rather than left in place harmlessly.
+	check "holds no capabilities"     '[ "$(awk "/^CapEff:/ {print \$2}" /proc/'"$pid"'/status)" = "0000000000000000" ]'
 	check "runs as uid 65532"         '[ "$(awk "/^Uid:/ {print \$2}" /proc/'"$pid"'/status)" = "65532" ]'
 	check "no_new_privs set"          '[ "$(awk "/^NoNewPrivs:/ {print \$2}" /proc/'"$pid"'/status)" = "1" ]'
 	# The confinement label of this specific process, which is the question the profile existing does
 	# not answer: a loaded profile that never attached leaves OpenBao unconfined with nothing to say so.
 	check "confined by openbao profile" 'grep -q "^openbao (enforce)" /proc/'"$pid"'/attr/current'
+else
+	echo "  ....  OpenBao is not running, so its privilege and confinement checks did not run"
 fi
 
 echo "Host"
+# Load-bearing rather than hygiene. With mlock gone from OpenBao 2.x, keeping decrypted secret material
+# out of swap is entirely a property of there being no swap -- this is upstream's own guidance ("disable
+# or encrypt swap instead") and the only thing standing where mlock used to.
 check "no swap active"               '[ "$(awk "NR>1" /proc/swaps | wc -l)" -eq 0 ]'
 check "core dumps discarded"         'grep -q "/bin/false" /proc/sys/kernel/core_pattern'
 check "ptrace_scope is 3"            '[ "$(cat /proc/sys/kernel/yama/ptrace_scope)" = "3" ]'
