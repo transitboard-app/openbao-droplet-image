@@ -101,6 +101,27 @@ rc-update add openbao-pod-routes default
 # reboot is the whole availability story.
 rc-update add openbao default
 
+echo "==> cloud user"
+# WITHOUT THIS THE NODE IS UNREACHABLE, and nothing says so.
+#
+# tiny-cloud ships CLOUD_USER commented out (`#CLOUD_USER=alpine`), so it is empty. init__set_ssh_keys
+# then runs `getent passwd ""`, fails to find the user, logs "failed to find user" to the system log and
+# returns -- without writing /root/.ssh/authorized_keys. The Droplet boots, configures its network and
+# answers on port 22 with sshd running, and refuses every key. Alpine's own cloud images set this and
+# create an `alpine` user; an image built by alpine-make-vm-image has neither.
+#
+# root, because that is the account DigitalOcean injects keys for and the only one sshd here admits --
+# see AllowUsers in 10-appliance.conf. `create_default_user` finds root already exists and skips.
+#
+# Found on a real Droplet. QEMU could not have found it: with no metadata service there are no keys to
+# install either way, so the step looks identical whether it works or not.
+sed -i 's|^#\?CLOUD_USER=.*|CLOUD_USER=root|' /etc/tiny-cloud.conf
+grep -q '^CLOUD_USER=root' /etc/tiny-cloud.conf || echo 'CLOUD_USER=root' >> /etc/tiny-cloud.conf
+grep -q '^CLOUD_USER=root' /etc/tiny-cloud.conf || {
+	echo "FATAL: CLOUD_USER is not set; the node would boot unreachable" >&2
+	exit 1
+}
+
 echo "==> hardening"
 passwd -l root
 

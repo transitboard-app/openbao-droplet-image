@@ -113,6 +113,9 @@ check "binary provenance kept"    "test -s $R/etc/openbao-binary-provenance"
 check "no kernel symbol map"      "! ls $R/boot/System.map-* 2>/dev/null | grep -q ."
 check "no syslinux payload"       "! test -d $R/usr/share/syslinux"
 check "chronyd is client-only"    "grep -q '^port 0' $R/etc/chrony/conf.d/10-appliance.conf"
+# The check that would have caught an unreachable node. Empty CLOUD_USER makes tiny-cloud skip installing
+# the SSH keys DigitalOcean injects, leaving a Droplet that boots, runs sshd, and admits nobody.
+check "cloud user is root"        "grep -q '^CLOUD_USER=root' $R/etc/tiny-cloud.conf"
 check "root password locked"      "grep '^root:' $R/etc/shadow | grep -qE '^root:[!*]'"
 
 # Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names
