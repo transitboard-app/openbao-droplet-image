@@ -60,6 +60,14 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
   # Reading its own mount table is how the storage backend learns what filesystem it is writing to. The
   # `owner` qualifier keeps this to the process's own entry rather than every process on the host.
   owner @{PROC}/@{pid}/mountinfo r,
+  # Go 1.25 and later size GOMAXPROCS from the cgroup CPU quota, which it finds by reading mountinfo and
+  # cgroup above and then the quota itself. Granting mountinfo is what revealed this one: the profile
+  # produced a single denial, and fixing it let the runtime get one step further and stop at the next.
+  #
+  # OpenRC puts each service in its own cgroup, so the path is /sys/fs/cgroup/openrc.openbao/cpu.max.
+  # Deliberately no `owner` qualifier: that file is root-owned (`ouid=0`) while OpenBao runs as 65532,
+  # so an `owner` rule would match nothing and read exactly like a grant that works.
+  /sys/fs/cgroup/**/cpu.max r,
   owner @{PROC}/@{pid}/task/ r,
   owner @{PROC}/@{pid}/task/** r,
   /sys/kernel/mm/transparent_hugepage/hpage_pmd_size r,
