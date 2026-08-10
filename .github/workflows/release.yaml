@@ -58,6 +58,14 @@ jobs:
       # It reads mise.linux-x64.toml, which .miserc.toml's `auto_env = true` selects on a linux-x64 host.
       - uses: jdx/mise-action@v4
 
+      # GitHub's runner images ship a pre-seeded apt index which goes stale as Ubuntu moves superseded
+      # packages out of the pool, and `mise bootstrap packages apply` does not refresh it. Without this
+      # the install fails with a 404 on the exact version the cached index names -- the first run of this
+      # workflow died on `qemu-utils_8.2.2+ds-0ubuntu1.17_amd64.deb  404  Not Found`, which reads as a
+      # broken mirror rather than a stale index.
+      - name: Refresh the apt index
+        run: sudo apt-get update
+
       - name: Install system packages
         run: mise bootstrap packages apply --yes
 
