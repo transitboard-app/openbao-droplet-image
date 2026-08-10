@@ -338,7 +338,9 @@ run = [
 	# booted, answered on port 22 and installed no keys. This asserts the service RAN; it cannot assert
 	# success, because QEMU has no metadata service for it to succeed against.
 	"""grep -q "Fetching SSH keys" {{ vars.boot_work }}/boot.log || { echo "FATAL: cloud-ssh-keys never ran; nothing provided net" >&2; exit 1; }""",
-	"""grep -q "net.eth0" {{ vars.boot_work }}/boot.log || { echo "FATAL: net.eth0 never started" >&2; exit 1; }""",
+	# udhcpc, not the service name: OpenRC logs "Starting networking ... eth0", and the string "net.eth0"
+	# appears in the log only when an interface FAILS. Asserting on it made a passing boot look broken.
+	"""grep -q "udhcpc: started" {{ vars.boot_work }}/boot.log || { echo "FATAL: no interface ran DHCP" >&2; exit 1; }""",
 	"""echo "boot reached OpenRC, loaded AppArmor, and gated on TLS as intended" """,
 ]
 
