@@ -65,6 +65,10 @@ alpine_mirror = "https://dl-cdn.alpinelinux.org/alpine"
 #
 # It has no effect on a running node at all: tiny-cloud grows the root filesystem to fill the Droplet's
 # disk on first boot, measured -- this image on a 5 GiB disk ends with a 5118 MiB root filesystem.
+# The checksum mise verified the OpenBao download against, repeated here only so the provenance file
+# inside the image can name what the stripped binary came from.
+bao_sha256 = "736b8ecf354fda6b2af62e4ae064f12fe6c52d7db8425b9c6de22f286a5485ec"
+
 image_size = "1G"
 image_name = "openbao-appliance"
 
@@ -94,6 +98,12 @@ IMAGE = "{{ config_root }}/out/{{ vars.image_name }}.qcow2"
 # wget, needed because alpine-make-vm-image fetches static apk-tools with it on any non-Alpine host, and
 # Ubuntu's minimal images ship curl but not wget. Without it the build stops at
 # `wget: not found` before writing anything.
+# binutils for `strip`, which runs on the host so the image never carries it.
+# bzip2 for the compress task, and binutils for `strip`, which runs on the host so the image never
+# carries it. bzip2 happened to be present on the GitHub runner, which hid its absence until the build
+# ran on a minimal Ubuntu.
+"apt:bzip2" = "latest"
+"apt:binutils" = "latest"
 "apt:wget" = "latest"
 "apt:qemu-utils" = "latest"
 "apt:qemu-system-x86" = "latest"
@@ -101,6 +111,8 @@ IMAGE = "{{ config_root }}/out/{{ vars.image_name }}.qcow2"
 "apt:fdisk" = "latest"
 "apt:e2fsprogs" = "latest"
 "apt:util-linux" = "latest"
+"apk:bzip2" = "latest"
+"apk:binutils" = "latest"
 "apk:wget" = "latest"
 "apk:qemu-img" = "latest"
 "apk:qemu-system-x86_64" = "latest"
@@ -166,6 +178,18 @@ run = [
 	# not installed on a minimal Ubuntu and is not worth a package. Bytes 18-19 are e_machine,
 	# little-endian; 0x003e is x86-64.
 	"""test "$(od -An -tx1 -j18 -N2 {{ vars.stage_dir }}/bao | tr -d ' ')" = "3e00" || { echo 'staged bao is not an x86-64 ELF' >&2; exit 1; }""",
+	# Stripped here, on the build host, not in the chroot -- doing it in the image would mean installing
+	# binutils into the appliance to run `strip` once. Removes the ELF symbol table and DWARF: 186 MiB
+	# to 136 MiB, 17% of the whole image. Go keeps its own pclntab, so panics still name functions, and
+	# the stripped binary was run and reports its version correctly.
+	#
+	# Debug symbols on a host holding unsealed key material are worth more to somebody reverse
+	# engineering it than to us.
+	"strip --strip-all {{ vars.stage_dir }}/bao",
+	# The one place the image is not byte-identical to what upstream published, so the link is recorded
+	# rather than lost. mise verified the download against a pinned checksum before any of this ran.
+	"""printf 'upstream %s\\nstripped %s\\n' "{{ vars.bao_sha256 }}" "$(sha256sum {{ vars.stage_dir }}/bao | cut -d' ' -f1)" > {{ vars.stage_dir }}/provenance""",
+	"""{{ vars.stage_dir }}/bao version >/dev/null || { echo 'bao does not run after stripping' >&2; exit 1; }""",
 	"""echo "staged bao: $(bao version | head -1)" """,
 ]
 
@@ -226,10 +250,19 @@ run = [
 	"""qemu-img info "$IMAGE" """,
 ]
 
+# qcow2 never releases a cluster once written, so the image is still the size of its high-water mark
+# even after setup.sh removes 80 MiB from it. A convert rewrites only the clusters that hold data, and
+# setup.sh zeroed the free space precisely so the freed ones qualify.
+[tasks."build:compact"]
+description = "Rewrite the image without the clusters its build freed"
+run = [
+	"""before=$(stat -c %s "$IMAGE"); qemu-img convert -O qcow2 "$IMAGE" "$IMAGE.compact" && mv "$IMAGE.compact" "$IMAGE" && echo "compacted $((before / 1048576)) MiB -> $(( $(stat -c %s "$IMAGE") / 1048576 )) MiB"""",
+]
+
 [tasks.build]
 description = "Build the appliance image (needs root)"
 depends = ["stage"]
-run = [{ task = "build:image" }, { task = "build:assert" }]
+run = [{ task = "build:image" }, { task = "build:compact" }, { task = "build:assert" }]
 
 [tasks.verify]
 description = "Assert the built image's contents without booting it"

@@ -13,13 +13,21 @@ echo "==> installing OpenBao"
 addgroup -g "$BAO_GID" -S openbao
 adduser -u "$BAO_UID" -G openbao -S -H -D -s /sbin/nologin openbao
 
+# Already stripped by the stage:payload task, on the build host. Deliberately not stripped here: doing
+# it in the chroot would mean installing binutils INTO the image to run `strip` once, which is exactly
+# the kind of build tool this appliance exists to not have.
 install -m 0755 -o root -g root /mnt/bao /usr/sbin/bao
+
+# Stripping is the one place the image stops being byte-identical to what upstream published, so the
+# link is recorded rather than lost: this file names the checksum mise verified the download against and
+# the checksum of what actually shipped.
+install -m 0644 -o root -g root /mnt/provenance /etc/openbao-binary-provenance
 
 # Deliberately NOT setcap'd. CAP_IPC_LOCK is granted at start time as an *ambient* capability by
 # supervise-daemon (see /etc/init.d/openbao), which has two advantages over a file capability: the
-# binary stays byte-identical to the one upstream published and pinned by digest, and ambient
-# capabilities survive alongside no_new_privs, which file capabilities do not -- setting both would
-# have silently produced a process with neither.
+# binary is otherwise unmodified from upstream's, and ambient capabilities survive alongside
+# no_new_privs, which file capabilities do not -- setting both would have silently produced a process
+# with neither.
 
 install -d -o root -g root -m 0755 /etc/openbao
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /etc/openbao/tls
@@ -81,7 +89,7 @@ rc-update add tiny-cloud-boot boot
 rc-update add tiny-cloud-early default
 rc-update add tiny-cloud-main default
 rc-update add tiny-cloud-final default
-rc-update add chronyd default
+rc-update add chronyd default   # client-only; see /etc/chrony/conf.d/10-appliance.conf
 rc-update add sshd default
 rc-update add openbao-pod-routes default
 
@@ -145,6 +153,13 @@ echo "==> removing what the appliance does not run"
 # 60 MiB scripting runtime on the host holding every production credential, which is the exact thing
 # choosing tiny-cloud over cloud-init avoided.
 rm -rf /usr/bin/python3* /usr/lib/python3* /usr/lib/libpython3* 2>/dev/null || true
+
+# Python's dependency closure, orphaned by the line above and left behind because that is an `rm` rather
+# than an `apk del` -- apk would refuse, since `apparmor` declares python3 as a hard dependency.
+#
+# Measured after the fact: nothing in the image references libsqlite3 or libmpdec at all. libstdc++ is
+# NOT in this list and must not be: apparmor_parser links it, and removing it takes AppArmor with it.
+rm -f /usr/lib/libsqlite3.so* /usr/lib/libmpdec*
 # /usr/bin/python is a symlink to python3 and is left dangling by the line above. Harmless in itself,
 # but verify-image rejects dangling symlinks wholesale -- the check exists because deleting a binary
 # that other names point at is exactly how `mount` went missing once.
@@ -167,6 +182,40 @@ rm -f /usr/bin/python
 # Removing the mode bits keeps the binary working for root, which is the only user here, while leaving
 # nothing setuid on the image for a non-root process to target.
 chmod u-s,g-s /bin/bbsuid
+
+# Kernel modules for hardware this machine does not have and filesystems it will never mount.
+#
+# This is attack surface before it is size. A filesystem or network-protocol parser in the kernel is a
+# classic exploit target, and a module that is not on disk cannot be autoloaded by anything that
+# provokes the kernel into trying -- `mount -t squashfs` on a crafted image, say. This appliance mounts
+# exactly two filesystems, ext4 for its root and ext4 for the Raft volume, and speaks TCP over virtio.
+#
+# Kept deliberately: virtio-rng, because this host generates keys and wants entropy; nvme, because
+# DigitalOcean's storage presentation is not guaranteed to stay virtio-blk; and the whole crypto and
+# ipv4/ipv6 trees.
+release="$(ls /lib/modules | head -1)"
+modules="/lib/modules/$release/kernel"
+for dead in sound drivers/gpu drivers/usb drivers/md drivers/hid drivers/input \
+            drivers/target drivers/message drivers/xen drivers/bluetooth \
+            net/netfilter net/sched net/sunrpc net/ceph net/sctp net/bridge net/9p; do
+	rm -rf "${modules:?}/$dead"
+done
+
+# Every filesystem except the one this appliance uses. ext4 needs jbd2 and mbcache beside it.
+find "$modules/fs" -mindepth 1 -maxdepth 1 \
+	! -name ext4 ! -name jbd2 ! -name 'mbcache*' -exec rm -rf {} + 2>/dev/null || true
+
+# modules.dep still describes what was deleted, and a stale dependency file makes modprobe fail in a way
+# that reads as a missing driver rather than a stale index.
+depmod -a "$release"
+
+# The kernel symbol map, which exists to decode an oops on a machine with a debugger attached. This one
+# sets ptrace_scope=3 and has no debugger, and the file is 6.1 MiB.
+rm -f /boot/System.map-*
+
+# syslinux's installable payload, 3.5 MiB. extlinux has already been installed into /boot by this point,
+# so what is left is the source material for an installation that has happened.
+rm -rf /usr/share/syslinux
 
 rm -rf /var/cache/apk/* /tmp/* 2>/dev/null || true
 
@@ -191,5 +240,18 @@ cat >> /etc/openbao-appliance-packages <<'REMOVED'
 #   busybox-suid (/bin/bbsuid) -- the setuid helper; nothing here runs as a non-root human
 #   apk-tools (/sbin/apk)      -- removed last; this image is replaced, never patched in place
 REMOVED
+
+# Zero the free space, which does two things and the second matters more than the first.
+#
+# Size: qcow2 allocates a cluster the moment it is written and never releases it when the guest deletes
+# the file, so an image that grew to 300 MiB and then had 80 MiB removed is still a 300 MiB file. Only
+# zero clusters can be dropped, and only by a rewrite -- see the build:compact task.
+#
+# Hygiene: everything deleted above is still readable in the freed blocks -- the Python runtime, the
+# pruned kernel modules, the apk cache and its index. This image is published, so those remnants would
+# be published with it. Zeroing removes them rather than merely unlinking them.
+dd if=/dev/zero of=/ZEROFILL bs=1M 2>/dev/null || true
+rm -f /ZEROFILL
+sync
 
 echo "==> setup complete"

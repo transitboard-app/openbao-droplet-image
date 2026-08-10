@@ -103,6 +103,16 @@ check "no package manager"        "! test -e $R/sbin/apk"
 check "package record populated"  "[ \"$packages\" -gt 50 ]"
 check "no setuid binaries"        "[ \"$setuid\" -eq 0 ]"
 check "no interpreters"           "! ls $R/usr/bin/python3* $R/usr/bin/perl 2>/dev/null | grep -q ."
+# Python's dependency closure, orphaned when its files were removed. libstdc++ is deliberately absent
+# from this check: apparmor_parser links it.
+check "no orphaned sqlite"        "! ls $R/usr/lib/libsqlite3.so* 2>/dev/null | grep -q ."
+check "no orphaned mpdec"         "! ls $R/usr/lib/libmpdec* 2>/dev/null | grep -q ."
+# Symbols on a host holding unsealed key material help an attacker more than an operator.
+check "bao is stripped"           "! readelf -S $R/usr/sbin/bao 2>/dev/null | grep -q '\.symtab'"
+check "binary provenance kept"    "test -s $R/etc/openbao-binary-provenance"
+check "no kernel symbol map"      "! ls $R/boot/System.map-* 2>/dev/null | grep -q ."
+check "no syslinux payload"       "! test -d $R/usr/share/syslinux"
+check "chronyd is client-only"    "grep -q '^port 0' $R/etc/chrony/conf.d/10-appliance.conf"
 check "root password locked"      "grep '^root:' $R/etc/shadow | grep -qE '^root:[!*]'"
 
 # Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names
@@ -118,6 +128,20 @@ check "no dangling symlinks"      "[ -z \"$dangling\" ]"
 # Resolved against the image root rather than followed. /bin/mount is a symlink to the absolute path
 # /bin/bbsuid, so `test -e` on it asks about the HOST's /bin/bbsuid and answers a question nobody asked.
 check "mount resolves in-image"   "test -x $R\$(readlink $R/bin/mount)"
+
+echo "==> kernel modules"
+# Attack surface before size: a filesystem or protocol parser in the kernel is a classic exploit target,
+# and a module that is not on disk cannot be autoloaded by anything that provokes the kernel into
+# trying. This appliance mounts ext4 and speaks TCP over virtio; everything else was removed.
+modules="$(find $R/lib/modules -name '*.ko*' 2>/dev/null | wc -l)"
+echo "  modules present: $modules ($(du -sh $R/lib/modules 2>/dev/null | cut -f1))"
+check "no sound drivers"          "! test -d $R/lib/modules/*/kernel/sound"
+check "no unused filesystems"     "! ls -d $R/lib/modules/*/kernel/fs/btrfs $R/lib/modules/*/kernel/fs/xfs $R/lib/modules/*/kernel/fs/ntfs3 2>/dev/null | grep -q ."
+check "ext4 kept"                 "ls $R/lib/modules/*/kernel/fs/ext4/ext4.ko* >/dev/null 2>&1"
+check "virtio_scsi kept"          "ls $R/lib/modules/*/kernel/drivers/scsi/virtio_scsi.ko* >/dev/null 2>&1"
+check "virtio_blk kept"           "ls $R/lib/modules/*/kernel/drivers/block/virtio_blk.ko* >/dev/null 2>&1"
+check "virtio_net kept"           "ls $R/lib/modules/*/kernel/drivers/net/virtio_net.ko* >/dev/null 2>&1"
+check "no netfilter"              "! test -d $R/lib/modules/*/kernel/net/netfilter"
 
 echo "==> services"
 # `test -L`, not `ls`. Runlevel entries are symlinks to absolute paths (/etc/init.d/openbao), so they
