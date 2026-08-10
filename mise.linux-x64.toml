@@ -333,6 +333,12 @@ run = [
 	"""grep -iE "AppArmor|expand_root|TLS material|Starting|\\[ !! \\]" {{ vars.boot_work }}/boot.log | head -30 || true""",
 	"""grep -q "Loading AppArmor profiles" {{ vars.boot_work }}/boot.log || { echo "FATAL: AppArmor profiles never loaded; the boot did not reach OpenRC" >&2; exit 1; }""",
 	"""grep -q "No TLS material" {{ vars.boot_work }}/boot.log || { echo "FATAL: the openbao service never ran its TLS gate" >&2; exit 1; }""",
+	# The regression check for the bug that shipped three times. Nothing provided `net`, so every service
+	# declaring `need net` -- tiny-cloud-main and cloud-ssh-keys both -- silently never ran, and the node
+	# booted, answered on port 22 and installed no keys. This asserts the service RAN; it cannot assert
+	# success, because QEMU has no metadata service for it to succeed against.
+	"""grep -q "Fetching SSH keys" {{ vars.boot_work }}/boot.log || { echo "FATAL: cloud-ssh-keys never ran; nothing provided net" >&2; exit 1; }""",
+	"""grep -q "net.eth0" {{ vars.boot_work }}/boot.log || { echo "FATAL: net.eth0 never started" >&2; exit 1; }""",
 	"""echo "boot reached OpenRC, loaded AppArmor, and gated on TLS as intended" """,
 ]
 

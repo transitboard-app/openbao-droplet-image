@@ -119,6 +119,15 @@ check "cloud user is root"        "grep -q '^CLOUD_USER=root' $R/etc/tiny-cloud.
 # Reachability of this node cannot depend on tiny-cloud, which installs no keys at all when CLOUD_USER
 # is unset and reports it only as an info line in the system log.
 check "own key installer present" "test -x $R/etc/init.d/cloud-ssh-keys"
+# The check that would have caught a node which boots, answers on port 22, and installs no keys: nothing
+# provided `net`, so every service declaring `need net` never ran.
+check "net.eth0 enabled"          "test -L $R/etc/runlevels/default/net.eth0"
+check "net.eth1 enabled"          "test -L $R/etc/runlevels/default/net.eth1"
+check "net.lo enabled at boot"    "test -L $R/etc/runlevels/boot/net.lo"
+# OpenBao advertises its private address and the firewall admits 8200 from nowhere else.
+check "private interface defined" "grep -q '^iface eth1 inet dhcp' $R/etc/network/interfaces"
+# Without this, a Droplet with no VPC interface leaves `net` unsatisfied and nothing that needs it runs.
+check "net deps are not strict"   "grep -q '^rc_depend_strict=\"NO\"' $R/etc/rc.conf"
 check "root password locked"      "grep '^root:' $R/etc/shadow | grep -qE '^root:[!*]'"
 
 # Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names

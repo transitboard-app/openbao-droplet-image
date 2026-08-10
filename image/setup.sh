@@ -76,6 +76,31 @@ grep -q "console=ttyS0" /boot/extlinux.conf || {
 }
 echo "    $(grep -m1 'APPEND' /boot/extlinux.conf | tr -s ' ')"
 
+echo "==> networking"
+# The per-interface services Alpine expects, and which alpine-make-vm-image does not create. Without
+# these, `networking` is in no runlevel, nothing provides `net`, and every service that needs it never
+# runs -- see the comment in /etc/network/interfaces for the full failure.
+#
+# This is what the working Alpine-on-DigitalOcean images do, and the shape is Alpine's own convention:
+# net.lo in boot, one net.<iface> per interface in default, each a symlink to the networking script.
+for interface in lo eth0 eth1; do
+	ln -sf networking "/etc/init.d/net.$interface"
+done
+# `net` must be satisfied by ANY interface coming up, not all of them. OpenRC defaults to strict
+# dependencies, under which one failing provider leaves the whole virtual unsatisfied -- so a Droplet
+# created without VPC networking, where eth1 does not exist, would leave `net` unprovided and take
+# cloud-ssh-keys and tiny-cloud-main down with it. That is the exact failure this image already shipped
+# once, reached by a different route.
+#
+# Measured in QEMU, which has a single NIC: net.eth1 fails with "Cannot find device eth1" and net.eth0
+# comes up fine. With this set, that is a working boot rather than an unreachable node.
+sed -i 's|^#\?rc_depend_strict=.*|rc_depend_strict="NO"|' /etc/rc.conf
+grep -q '^rc_depend_strict="NO"' /etc/rc.conf || echo 'rc_depend_strict="NO"' >> /etc/rc.conf
+
+rc-update add net.lo boot
+rc-update add net.eth0 default
+rc-update add net.eth1 default
+
 echo "==> services"
 # boot: before networking, and before anything that needs a confined process or a grown filesystem.
 rc-update add apparmor boot
