@@ -4,12 +4,12 @@ The DigitalOcean custom image the Transitboard OpenBao Droplets boot: a single-p
 running OpenBao directly on the host.
 
 It replaces a Debian Droplet that installed podman at first boot and ran OpenBao in a container. What it
-buys is **attack surface**: 101 packages against about 210, no container runtime, no package manager, no
-interpreter, no shell for the service account, no setuid binary, and a kernel with the module tree cut
-down to what this machine actually uses. OpenBao runs directly on the host under an AppArmor profile that
-grants no capability of any kind — a stricter version of the `--read-only`, `--cap-drop ALL` and
-near-empty filesystem podman was providing, because it constrains the process rather than the container
-around it.
+buys is **attack surface**: 93 packages against about 210, no container runtime, no package manager, no
+interpreter, no shell for the service account, no setuid binary, no SSH client, no bootloader installer,
+no raw filesystem editor, and a kernel with the module tree and the initramfs cut down to what this
+machine actually uses. OpenBao runs directly on the host under an AppArmor profile that grants no
+capability of any kind — a stricter version of the `--read-only`, `--cap-drop ALL` and near-empty
+filesystem podman was providing, because it constrains the process rather than the container around it.
 
 It is **not** built so OpenBao can lock its memory. That was the original reason and it is dead: OpenBao
 2.x has dropped mlock support outright, `disable_mlock = false` is a fatal configuration error, and a
@@ -74,8 +74,8 @@ elevating, because sudo resets `PATH` and would not otherwise see a mise-managed
 
 ## What is in the image, and what is not
 
-101 packages, against about 210 for the Debian-plus-podman node it replaces. `mise run verify` prints
-the count on every build rather than leaving it to be quoted from memory.
+93 packages, against about 210 for the Debian-plus-podman node it replaces. `mise run verify` prints the
+count on every build rather than leaving it to be quoted from memory.
 
 Most of that reduction is not Alpine. It is dropping the container runtime (55 packages on its own) and
 using `tiny-cloud` instead of `cloud-init` — 5 MiB against 62 MiB, because cloud-init brings a Python
@@ -83,18 +83,63 @@ runtime with it. `apparmor` then turned out to depend on Python anyway, so the b
 installing: `apparmor_parser` is a C binary and the OpenRC service is plain shell, so nothing the
 appliance runs needs an interpreter.
 
-There is no package manager, no shell for the `openbao` user, no interpreter, and no setuid binary.
-`mise run verify` fails if any of those reappear.
+The rest is things that arrive as dependencies, do a job during the build, and have no caller on a
+running node. Each is removed and recorded in `/etc/openbao-appliance-packages`:
 
-Size is dominated by OpenBao itself: `bao` is 136 MiB stripped, of a 241 MiB image. Choosing a smaller
-distribution moves a number that was never the constraint — the reason to build this is the attack
-surface, not the megabytes.
+| Removed | Why it was there | Why it is not needed |
+| --- | --- | --- |
+| the OpenSSH **client** suite | the `openssh` meta-package | every session is inbound; the tunnels are `ssh -L` from your machine |
+| `tc`, `ss`, `bridge`, `genl`, `libxtables` | the `iproute2` meta-package | only `ip route replace` is called; `ip` is in `iproute2-minimal` |
+| `syslinux`, `extlinux`, `mtools` | installing the bootloader | the bootloader is installed |
+| `mkinitfs`, `nlplug-findfs`, `cryptsetup`, `device-mapper` | building the initramfs | the initramfs is built, and nothing here updates a kernel |
+| `debugfs`, `badblocks`, `e2image` | `resize2fs` is in `e2fsprogs-extra` | a raw ext editor reads the Raft volume around its permissions |
+| `libffi`, `libgdbm`, `libpanelw`, `libreadline`, `libexpat` | Python's closure | Python is gone; nothing links them |
+| `libapk`, `/usr/share/apk` | apk | removing `/sbin/apk` and keeping the library that installs packages is half the job |
+
+There is no package manager, no shell for the `openbao` user, no interpreter, no setuid binary, no SSH
+client and no bootloader installer. `mise run verify` fails if any of those reappear.
+
+Size is dominated by OpenBao itself: `bao` is 136 MiB stripped, of a 201 MiB image. Of the remaining
+65 MiB, 12 MiB is the kernel and 5 MiB the initramfs. Choosing a smaller distribution moves a number that
+was never the constraint — the reason to build this is the attack surface, not the megabytes.
+
+The kernel is cut the same way, and the two halves have to be cut together. `setup.sh` prunes
+`/lib/modules` down to what a Droplet can present — virtio networking and storage, ext4, and nothing
+else — and then **regenerates the initramfs**, because the initramfs is built when the kernel package is
+installed and had been keeping a full copy of everything the prune removed. Modules are kept by
+dependency closure rather than by name: `virtio_net` loads with `net_failover`, and an image that keeps
+only the file named `virtio_net.ko` boots with no network at all.
+
+## Checking
+
+`Check` runs on every push and pull request: lint, build, offline verification, and the QEMU boot test —
+the same tasks the release runs, on the same `ubuntu-24.04` host, minus the publishing. It also fails if
+`mise.linux-x64.lock` is out of step with the config beside it, because a lockfile is only worth having
+if it describes the artifact that was actually built.
+
+Both build inputs are pinned by that lockfile: the version, the download URL and the checksum, for every
+platform. `.miserc.toml` sets `locked = true`, so mise installs what the lockfile says rather than what
+the registry offers today, and `locked_verify_provenance = true`, so a tool that publishes a build
+attestation has it checked rather than merely its checksum. Refresh it with `mise lock` after changing a
+version, and commit the result.
 
 ## Releasing
 
 `Build and release the appliance image` is a manually triggered workflow — `workflow_dispatch` with the
 tag as an input. It builds, verifies, boots, compresses, and creates a release with the `.qcow2.bz2`
-attached, plus the sha256 and the full package list in the notes.
+attached, plus the sha256, the build manifest and the full package list in the notes.
+
+It also **attests the artifact**. `actions/attest-build-provenance` records which repository, workflow
+and commit produced the file, signed by GitHub's own identity, so anyone can check where a published
+image came from without trusting the image:
+
+```bash
+gh attestation verify openbao-appliance.qcow2.bz2 --repo <owner>/<repo>
+```
+
+The image carries the same facts internally at `/etc/openbao-appliance-release` — commit, Alpine branch,
+OpenBao version, build date — but that is the artifact describing itself. The attestation is the half a
+stranger can rely on, which matters for an image offered for other people to boot.
 
 It is manual on purpose: this image is the boot medium for the machine holding every production
 credential, so it is released when someone decides to, not when a branch moves. Tags are CalVer
@@ -134,6 +179,13 @@ ssh root@<node> 'rc-service openbao start'
 volume and the certificate is still there and still valid, so this is once per volume rather than once per
 node. `openbao-volume` creates the directory at boot, so it exists before the first `scp`.
 
+**Running without an attached volume** is supported and has to be asked for. A node that cannot find
+exactly one DigitalOcean volume refuses to start, because OpenBao quietly writing its Raft store to the
+boot disk while an attached volume sits empty is the one failure a secret store cannot absorb. Setting
+`RAFT_DEVICE="none"` in `/etc/conf.d/openbao-volume` says you mean it, and cannot be reached by a volume
+failing to attach. The store then does not survive the Droplet: take Droplet snapshots, and expect to
+reinstall the TLS material on each new node.
+
 All three files are required — `ca.crt` because the listener names it as `tls_client_ca_file` — and the
 service applies `root:openbao` and the right modes to them itself on every start, so nothing here has to
 get a `chown` right.
@@ -156,6 +208,17 @@ by editing rather than by deleting.
 Every boot after that starts OpenBao on its own — which is a deliberate change from the Debian node,
 whose unit was installed disabled so a reboot could not skip the TLS step. With one node and no quorum,
 a secret store that stays down after an unattended reboot is the worse failure.
+
+**The `bao` CLI on the node is already pointed at its own server.** `/etc/profile.d/openbao.sh` sets
+`BAO_ADDR` to the address OpenBao advertises and `BAO_CACERT` to the CA the listener is configured with,
+both read from the loaded fragments rather than hard-coded, so they stay right if you move the files or
+use ACME. Without that, the first command anybody ran answered `x509: certificate signed by unknown
+authority` and the obvious way out was `-tls-skip-verify` — which turns off certificate verification on
+the machine holding every production credential. **You should never need that flag here; if you do, that
+is a bug in this image.**
+
+It is set for login shells, so an interactive `ssh root@<node>` has it and `ssh root@<node> 'bao status'`
+does not — that runs a non-login shell. Use `ssh root@<node> 'sh -lc "bao status"'` for a one-off.
 
 Then check the claims:
 
@@ -193,10 +256,16 @@ That is why they are three files named by concern rather than one.
 
 The two marked **structural** are coupled to the rest of the image — `00-storage.hcl` to the
 `openbao-volume` service that mounts the attached volume there and to the AppArmor profile that grants
-writes on exactly that path, and `10-listener.hcl` to the TLS gate in the service's `start_pre`. Change
-either and those stop applying. `20-audit.hcl` is a plain default: delete it, or replace it to send audit
-elsewhere. It ships enabled because OpenBao 2.x cannot enable an audit device through the API at all, so
-a node without one has no way to gain one without a restart.
+writes on exactly that path. Change it and those stop applying. `20-audit.hcl` is a plain default:
+delete it, or replace it to send audit elsewhere. It ships enabled because OpenBao 2.x cannot enable an
+audit device through the API at all, so a node without one has no way to gain one without a restart.
+
+**The service will not start until the certificate your listener names is actually there** — but it
+gates on *your* configuration, not on the paths the image happens to ship. Replace `10-listener.hcl`
+with an ACME listener, or one with `tls_disable = true` behind a proxy that terminates TLS, or one
+pointing somewhere else entirely, and the node starts. Name a file that is not there and it refuses and
+tells you which file, which is the point of the gate and is unchanged. `user_data` is read into the
+configuration before the gate runs, so a listener supplied that way counts.
 
 `user_data` must begin with the line `#openbao-config`. Without it the document is ignored rather than
 loaded, so a Droplet created with `user_data` meant for something else does not end up with a secret store
@@ -310,24 +379,27 @@ LSM: initializing lsm=lockdown,capability,landlock,yama,apparmor
 AppArmor: AppArmor initialized
  * Loading AppArmor profiles ... [ ok ]
    ++ expand_root: starting / done
- * No TLS material in /etc/openbao/tls.
+ * The listener names TLS material that is not there:
+ *     /var/lib/openbao/tls/server.crt
  * openbao-selfcheck: all checks passed
 ```
 
 AppArmor is in the *active* LSM stack, not merely compiled in. The TLS gate refuses to start OpenBao and
-says how to fix it, which is the intended first-boot state — and the self-check now says so rather than
+names the file it wanted, which is the intended first-boot state — and the self-check says so rather than
 reporting it as a fault. Root expansion is tiny-cloud's, measured: a 1 GiB image on a 5 GiB disk ends
 with a 5118 MiB root filesystem.
 
-101 packages, 0 setuid/setgid binaries, no interpreter, no package manager, no dangling symlinks, 370
-kernel modules in 11 MiB. 241 MiB qcow2, **95 MiB compressed**.
+93 packages, 0 setuid/setgid binaries, no interpreter, no package manager, no SSH client, no dangling
+symlinks, 293 kernel modules in 6.4 MiB and a 5.4 MiB initramfs holding 20. 201 MiB of qcow2,
+**71 MiB compressed**. 166 offline checks.
 
 **OpenBao has been run through this image.** Against a faked DigitalOcean environment — a SCSI disk
 presenting as vendor `DO` model `Volume`, a metadata service on `169.254.169.254`, and two interfaces —
 the appliance mounted its Raft volume through sysfs, read its private address, unsealed, served KV v2
-reads and writes, reported itself Raft leader, wrote audit records, survived a reboot with the store
-intact, and produced **zero AppArmor denials against the server** across all of it. `documentation/`
-holds the audit that established this and the one that preceded it.
+reads and writes, wrote a policy, enabled AppRole, wrote audit records, rotated its audit log, survived a
+reboot with the store intact, and produced **zero AppArmor denials against the server** across all of it.
+`scp` of the TLS material, `bao status` with no environment set by hand, and `ip route replace` were all
+exercised on the same node. `documentation/` holds the audits that established this.
 
 ### Still unsettled
 
@@ -347,5 +419,9 @@ holds the audit that established this and the one that preceded it.
   rescue system with this disk attached and needs nothing baked into the image — or rebuilding the node
   and reattaching the Raft volume. That is a decision, not an accident, and it is worth re-reading before
   the first real incident.
+- **Cutting `drivers/net` to virtio is a bet that DigitalOcean's network presentation does not change** —
+  and it is the opposite of the bet made about storage, where `drivers/nvme/host` is deliberately kept
+  against exactly that possibility. Both are argued in `image/setup.sh`; only one of them can be right if
+  the presentation ever moves. The boot test is what makes the network side safe to hold.
 
 `AGENTS.md` has the rest.

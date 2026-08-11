@@ -71,6 +71,30 @@ grant above it would otherwise let OpenBao rewrite its own private key. What mak
 overrides no grant anything needs; what made `deny /** w` unsafe is that it overrode one. Check what a
 deny would shadow before adding it, and keep denials narrow.
 
+**Pruning a module means pruning what it loads with.** `virtio_net` depends on `net_failover`, which
+lives in the same directory — so a prune that keeps `virtio_net.ko` by name and deletes the rest of
+`drivers/net` produces an image where every offline check passes, `virtio_net` is demonstrably present,
+and the node boots with `Cannot find device "eth0"`: no network, therefore no metadata, no SSH and no
+OpenBao. `prune_modules` in `image/setup.sh` reads the closure out of `modules.dep` and both
+`verify-image` and the build assert it independently, the build by treating any `depmod` warning as
+fatal. Do not prune by name.
+
+**The initramfs is built before `setup.sh` runs, so pruning `/lib/modules` does not touch it.** For as
+long as this image existed, every module the build removed was still in `/boot/initramfs-virt` — 1.4 MiB
+of GPU drivers, 724 KiB of USB, the whole filesystem tree — and the rule above was true of the root
+filesystem and false of the boot medium beside it. `setup.sh` now regenerates the initramfs *after* the
+prune, which is what makes the two agree and which halved it. Anything that changes the module tree must
+stay on the correct side of that regeneration.
+
+**The TLS gate reads the configuration; it must never go back to a fixed path.** `start_pre()` requires
+whatever `tls_cert_file`, `tls_key_file` and `tls_client_ca_file` the loaded fragments name. It used to
+test three literal paths under `/var/lib/openbao/tls`, which was right for the default and refused every
+other arrangement — including the ACME listener `README.md` invites, and `tls_disable` for a node behind
+a terminating proxy. An image other people boot cannot gate on its own defaults. The fail-closed
+property is unchanged and is what the gate is for: a named certificate that is not there is still a
+refusal, and it now names the file rather than the image's assumption. `user_data` is read into
+`/run/openbao/config.d` **before** the gate, or a listener supplied that way is invisible to it.
+
 **A dependency cannot be declared on the metadata service, so exactly one service waits for it.**
 `need net` means an interface is configured. It cannot mean "the hypervisor is answering HTTP on
 `169.254.169.254`", because that endpoint is not a service on this machine and OpenRC has no handle on
@@ -80,6 +104,14 @@ virtual. `cloud-ssh-keys` and `openbao` declare `need metadata` and read files; 
 Do not give a consumer its own fetch. That is what was here before, and the two copies diverged — one
 retried fifteen times, the other tried once and produced a node that answered on port 22 with no secret
 store. Assert the wait once, or it will be got wrong twice.
+
+**Anything that makes an operator reach for `-tls-skip-verify` is a bug in this image, and for a long
+time the image was that bug.** Nothing set `BAO_CACERT`, so the first `bao status` anybody ran on a node
+answered `x509: certificate signed by unknown authority`, and the documented way out of that is the flag
+that turns off certificate verification on the host holding every production credential.
+`/etc/profile.d/openbao.sh` now derives `BAO_ADDR` and `BAO_CACERT` from the loaded configuration — read
+rather than hard-coded, so it stays right for a node whose operator moved the files or uses ACME. It is
+sourced by login shells only; `ssh <node> <command>` runs a non-login shell and does not get it.
 
 **The AppArmor profile confines the CLI as well as the server, because a profile attaches to a path.**
 `profile openbao /usr/sbin/bao` covers every execution of that binary, including the one an operator
@@ -167,6 +199,16 @@ signal path it depends on. Do not remove either without replacing what it does.
 - Do not add a `Co-Authored-By` trailer, or any other tool-attribution trailer, to a commit.
 - Bump `OPENBAO_IMAGE` and `BAO_SHA256` together, and keep them in step with
   `stack/infrastructure/platform/variables.tf`.
+- **Remove packages by editing `image/packages` where you can, and by `purge` in `setup.sh` only where
+  you cannot.** `apk` resolves a package set correctly and leaves its database honest; an `rm` leaves the
+  database claiming files that are gone. `purge` is for the ones apk would refuse because they are hard
+  dependencies of something needed — it deletes exactly the files apk recorded, symlinks included, and
+  writes its own line into `/etc/openbao-appliance-packages`. Never hand-list paths: that is how
+  `/bin/bbsuid` was deleted and took `mount` with it.
+- **This image is published for other people to boot, so a default is not a decision you get to make for
+  them.** Ship the safe default, make the alternative reachable without editing the image, and say what
+  it costs where they will read it. `RAFT_DEVICE=none` and the configuration-driven TLS gate are both
+  this shape: the accident stays impossible, the deliberate choice stays available.
 
 ## What is not settled
 
