@@ -5,3 +5,14 @@
 # itself, which is the expected case. Set it only when a node has more than one volume attached and the
 # choice of which holds the secret store should not be inferred.
 #RAFT_DEVICE="/dev/sda"
+
+# `none` runs the store on the Droplet's own disk, with no attached volume at all.
+#
+# This is the one way to say that on purpose, and it has to be said: with this unset, a node that cannot
+# find exactly one DigitalOcean volume refuses to start, because OpenBao quietly writing its Raft store
+# to the boot disk while an attached volume sits empty is the failure a secret store cannot absorb.
+#
+# What you give up is everything the volume was buying. The store no longer survives the Droplet, so
+# replacing a node for an image bump means restoring a snapshot rather than reattaching a disk, and the
+# TLS material has to be installed again on each new node. Take Droplet snapshots if you choose this.
+#RAFT_DEVICE="none"

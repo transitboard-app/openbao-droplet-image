@@ -49,6 +49,17 @@ for proc in /proc/[0-9]*; do
 	break
 done
 
+# The certificate the CONFIGURATION names, not the one the image ships. A node using ACME or sitting
+# behind a terminating proxy has no certificate file at all and is correctly configured; a node whose
+# operator moved the files has one somewhere else. Reading it out of the fragments is what lets this
+# script describe either without being told which.
+config_values() {
+	grep -rhE "^[[:space:]]*$1[[:space:]]*=" \
+		/etc/openbao/config.d /run/openbao/config.d 2>/dev/null |
+		sed -e 's/.*=[[:space:]]*//' -e 's/^"//' -e 's/".*$//'
+}
+cert_file="$(config_values tls_cert_file | head -1)"
+
 # First boot is not a failure, and saying so is what keeps this script worth reading. The service refuses
 # to start until an operator has installed TLS material, so on a node that has not had it yet OpenBao is
 # correctly absent -- and a check that reports the intended first-boot state as a fault is one people
@@ -58,17 +69,34 @@ done
 # configured. Collapsing the first two would report a failed mount as an un-provisioned node, which is the
 # difference between "install the certificate" and "the disk is not there".
 configured=0
-if ! mountpoint -q /var/lib/openbao; then
+storage_ok=0
+
+# `RAFT_DEVICE=none` is the operator saying the store belongs on the boot disk, which is a supported
+# arrangement rather than a fault -- so it is reported as what it costs, not as a failure. Anything else
+# reaching that branch is a volume that should be mounted and is not.
+RAFT_DEVICE=""
+[ -f /etc/conf.d/openbao-volume ] && . /etc/conf.d/openbao-volume
+
+if [ "${RAFT_DEVICE:-}" = "none" ]; then
+	echo "  ....  RAFT_DEVICE=none: the store is on the Droplet's own disk and does not survive it"
+	storage_ok=1
+elif mountpoint -q /var/lib/openbao; then
+	storage_ok=1
+else
 	echo "  FAIL  the Raft volume is not mounted, so nothing below can be true"
 	echo "        see rc-service openbao-volume status; OpenBao must never run on the Droplet's own disk"
 	fail=1
-elif [ -f /var/lib/openbao/tls/server.crt ]; then
+fi
+
+# Either the certificate the listener names is in place, or no fragment names one at all -- and the
+# second is ACME or tls_disable rather than an unconfigured node. Reported a few lines further down.
+if [ "$storage_ok" = 1 ] && { [ -z "$cert_file" ] || [ -f "$cert_file" ]; }; then
 	configured=1
 fi
 
 if [ "$configured" = 0 ]; then
-	echo "  ....  no TLS material in /var/lib/openbao/tls, so OpenBao is correctly not running yet"
-	echo "        install it and start the service; README.md has the procedure"
+	echo "  ....  ${cert_file:-the listener certificate} is not there, so OpenBao is correctly not"
+	echo "        running yet; install it and start the service. README.md has the procedure"
 else
 	check "running"                   '[ -n "'"$pid"'" ]'
 fi
@@ -106,8 +134,18 @@ echo "  ....  $etc_fragments fragment(s) in /etc/openbao/config.d"
 # listener fragment that merely forgets the certificate does not fail, it starts talking to a public CA
 # and takes a temporary bind on port 80 for the HTTP-01 challenge. A node reached over a private address
 # can never complete that challenge, so it retries forever while every other signal here looks healthy.
-if grep -rqE '^[[:space:]]*tls_cert_file[[:space:]]*=' /etc/openbao/config.d/ /run/openbao/config.d/ 2>/dev/null; then
-	echo "  ....  listener TLS from a certificate file"
+# **Three states, not two.** This reported "TLS from a certificate file" or "TLS from ACME" and nothing
+# else, which was true for as long as the service refused to start without a certificate at a fixed
+# path. Now that the gate reads the configuration, `tls_disable = true` is a listener this node will
+# actually run -- and reporting it as "requesting a certificate from a public CA" describes a node
+# fetching certificates when it is in fact serving plaintext. A check that misdescribes the thing it is
+# checking is worse than no check.
+if [ "$(config_values tls_disable | head -1)" = "true" ]; then
+	echo "  WARN  the listener has tls_disable = true, so this node serves its API in PLAINTEXT."
+	echo "        Every token and secret crosses the network unencrypted. Intended only behind a"
+	echo "        proxy that terminates TLS on the same host."
+elif [ -n "$cert_file" ]; then
+	echo "  ....  listener TLS from a certificate file: $cert_file"
 else
 	echo "  ....  listener TLS from ACME -- no fragment sets tls_cert_file, so OpenBao is requesting"
 	echo "        a certificate from a public CA. Intended only if this node is publicly reachable."

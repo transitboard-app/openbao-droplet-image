@@ -91,25 +91,78 @@ reload() {
 	eend $? "Could not signal OpenBao; a rotated audit log would not be reopened"
 }
 
+# Every value a parameter is given across both configuration directories, one per line.
+#
+# The `^[[:space:]]*` anchor is what keeps a commented-out example from counting as configuration, which
+# matters here because the fragments this image ships document their alternatives in comments -- the
+# ACME note in 10-listener.hcl names tls_cert_file in prose directly above the real one.
+config_values() {
+	grep -rhE "^[[:space:]]*$1[[:space:]]*=" \
+		/etc/openbao/config.d /run/openbao/config.d 2>/dev/null |
+		sed -e 's/.*=[[:space:]]*//' -e 's/^"//' -e 's/".*$//'
+}
+
 start_pre() {
-	# The TLS gate. Equivalent to ConditionPathExists= on the systemd unit: refuse to start rather than
-	# restart-loop against material the operator has not installed yet. Returning 1 here makes OpenRC
-	# report a clean failure with this message, which is what the operator needs to see on first boot.
+	# DigitalOcean user_data, turned into a configuration fragment.
 	#
-	# **On the attached volume since 2026-08-11, not the boot disk**, which is what makes replacing a
-	# Droplet cheap: the certificate is about OpenBao's name rather than the node's address, so it is still
-	# valid, and it comes back with the volume rather than being copied. `need openbao-volume` in depend()
-	# is what guarantees the mount is there before this looks. The seal key did NOT move -- it stays on the
-	# boot disk so a snapshot of the volume is useless on its own. See D23.
+	# Done FIRST, before the TLS gate below, and the order is load-bearing rather than tidy: user_data
+	# may carry its own `listener`, so what TLS material this node needs is not known until it has been
+	# read. Gating before this point is how the gate came to be hard-coded to one path.
 	#
-	# ca.crt is gated with the other two because 10-listener.hcl names it as tls_client_ca_file: without it
-	# the server does not fail this check and then refuses to load, which reads as a configuration bug
-	# rather than as a missing file.
-	if [ ! -f /var/lib/openbao/tls/server.crt ] || [ ! -f /var/lib/openbao/tls/server.key ] ||
-		[ ! -f /var/lib/openbao/tls/ca.crt ]; then
-		eerror "No TLS material in /var/lib/openbao/tls."
-		eerror "Generate it with stack's scripts/generate-openbao-tls <openbao-dns-name>,"
-		eerror "copy server.crt, server.key and ca.crt there, then start again."
+	# /run is tmpfs, so this directory is rebuilt from scratch at every start and a fragment cannot
+	# outlive the user_data that produced it. The alternative -- writing into /etc -- leaves a stale file
+	# behind the moment user_data shrinks, which is the failure that is impossible to see in a diff.
+	install -d -o root -g openbao -m 0750 /run/openbao/config.d
+	rm -f /run/openbao/config.d/50-user-data.hcl
+	if [ -s /run/metadata/user-data ]; then
+		# A sentinel first line, so that a Droplet created with user_data meant for something else is
+		# ignored rather than fatal. Without it, any unrelated document -- a cloud-config someone pasted
+		# out of habit -- becomes a configuration parse error that stops the secret store from starting.
+		if [ "$(head -n1 /run/metadata/user-data)" = "#openbao-config" ]; then
+			# ASCII only, checked rather than assumed. DigitalOcean does not deliver user_data as UTF-8:
+			# a single multi-byte character is enough to corrupt the document in transit, and the
+			# em-dash that did it last time was in a comment. Caught here, it names the cause; left to
+			# OpenBao, it is a parse error pointing at a line that looks fine.
+			if [ -n "$(tr -d '\000-\177' < /run/metadata/user-data)" ]; then
+				eerror "user_data contains non-ASCII characters, which DigitalOcean does not deliver"
+				eerror "intact. Rewrite it in ASCII -- including its comments -- and rebuild the Droplet."
+				return 1
+			fi
+			cp /run/metadata/user-data /run/openbao/config.d/50-user-data.hcl
+			chown root:openbao /run/openbao/config.d/50-user-data.hcl
+			chmod 0640 /run/openbao/config.d/50-user-data.hcl
+			einfo "Loaded user_data as a configuration fragment"
+		else
+			einfo "user_data is not #openbao-config; ignoring it"
+		fi
+	fi
+
+	# The TLS gate, against the certificate the CONFIGURATION asks for rather than against the one this
+	# image happens to ship.
+	#
+	# It used to test three literal paths under /var/lib/openbao/tls, which was correct for the default
+	# and wrong for everything else: README.md invites replacing 10-listener.hcl with an ACME listener,
+	# and OpenBao supports `tls_disable` for a node behind a terminating proxy -- and under the old gate
+	# both of those refused to start, naming files the operator had deliberately not created. An image
+	# other people boot cannot gate on its own defaults.
+	#
+	# So the rule is: whatever certificate, key and CA the loaded fragments name must exist. That keeps
+	# the whole point of the gate -- refuse to start rather than restart-loop against material nobody
+	# installed -- while making it true of the configuration in force. It is also strictly stronger for
+	# an operator who moved the files, which previously passed the gate and then failed inside OpenBao.
+	#
+	# No tls_cert_file anywhere is not an error. It means ACME or tls_disable, both of which are
+	# deliberate choices with nothing for this to check; openbao-selfcheck reports which is in effect.
+	missing=""
+	for tls_file in $(config_values tls_cert_file) $(config_values tls_key_file) \
+		$(config_values tls_client_ca_file); do
+		[ -f "$tls_file" ] || missing="$missing $tls_file"
+	done
+	if [ -n "$missing" ]; then
+		eerror "The listener names TLS material that is not there:"
+		for tls_file in $missing; do eerror "    $tls_file"; done
+		eerror "Generate it with stack's scripts/generate-openbao-tls <openbao-dns-name>, copy"
+		eerror "server.crt, server.key and ca.crt to /var/lib/openbao/tls, then start again."
 		eerror "That directory is on the attached volume, so it only needs doing once per volume --"
 		eerror "a replacement Droplet reattaches it and this gate is already satisfied."
 		return 1
@@ -124,9 +177,24 @@ start_pre() {
 	#
 	# The key is 0640 and the certificates 0644, which is also why this is not a blanket chmod: a
 	# world-readable private key is the one mistake here that would not announce itself.
-	chown root:openbao /var/lib/openbao/tls/server.crt /var/lib/openbao/tls/server.key /var/lib/openbao/tls/ca.crt
-	chmod 0640 /var/lib/openbao/tls/server.key
-	chmod 0644 /var/lib/openbao/tls/server.crt /var/lib/openbao/tls/ca.crt
+	#
+	# Scoped to /var/lib/openbao/tls, which is the directory this image creates and documents. A
+	# certificate the operator put somewhere else is theirs, and silently rewriting the ownership of a
+	# path we do not manage is how a service breaks something that was working.
+	for tls_file in $(config_values tls_cert_file) $(config_values tls_client_ca_file); do
+		case "$tls_file" in /var/lib/openbao/tls/*)
+			chown root:openbao "$tls_file"
+			chmod 0644 "$tls_file"
+			;;
+		esac
+	done
+	for tls_file in $(config_values tls_key_file); do
+		case "$tls_file" in /var/lib/openbao/tls/*)
+			chown root:openbao "$tls_file"
+			chmod 0640 "$tls_file"
+			;;
+		esac
+	done
 
 	# The seal key, if this node has been given one. Absent is not an error: with no `seal` stanza
 	# anywhere OpenBao uses Shamir, which is the image's default and needs no file.
@@ -155,36 +223,6 @@ start_pre() {
 			eerror "key encoding. Write it without one:"
 			eerror "  printf %s \"\$key\" > /etc/openbao/seal/key"
 			return 1
-		fi
-	fi
-
-	# DigitalOcean user_data, turned into a configuration fragment.
-	#
-	# /run is tmpfs, so this directory is rebuilt from scratch at every start and a fragment cannot
-	# outlive the user_data that produced it. The alternative -- writing into /etc -- leaves a stale file
-	# behind the moment user_data shrinks, which is the failure that is impossible to see in a diff.
-	install -d -o root -g openbao -m 0750 /run/openbao/config.d
-	rm -f /run/openbao/config.d/50-user-data.hcl
-	if [ -s /run/metadata/user-data ]; then
-		# A sentinel first line, so that a Droplet created with user_data meant for something else is
-		# ignored rather than fatal. Without it, any unrelated document -- a cloud-config someone pasted
-		# out of habit -- becomes a configuration parse error that stops the secret store from starting.
-		if [ "$(head -n1 /run/metadata/user-data)" = "#openbao-config" ]; then
-			# ASCII only, checked rather than assumed. DigitalOcean does not deliver user_data as UTF-8:
-			# a single multi-byte character is enough to corrupt the document in transit, and the
-			# em-dash that did it last time was in a comment. Caught here, it names the cause; left to
-			# OpenBao, it is a parse error pointing at a line that looks fine.
-			if [ -n "$(tr -d '\000-\177' < /run/metadata/user-data)" ]; then
-				eerror "user_data contains non-ASCII characters, which DigitalOcean does not deliver"
-				eerror "intact. Rewrite it in ASCII -- including its comments -- and rebuild the Droplet."
-				return 1
-			fi
-			cp /run/metadata/user-data /run/openbao/config.d/50-user-data.hcl
-			chown root:openbao /run/openbao/config.d/50-user-data.hcl
-			chmod 0640 /run/openbao/config.d/50-user-data.hcl
-			einfo "Loaded user_data as a configuration fragment"
-		else
-			einfo "user_data is not #openbao-config; ignoring it"
 		fi
 	fi
 

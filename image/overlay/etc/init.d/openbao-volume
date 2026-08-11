@@ -22,9 +22,51 @@ depend() {
 	before openbao
 }
 
+# The directory layout under the mountpoint, applied whether or not there is a mount.
+#
+# **The mountpoint is root:openbao 0750, not 65532:65532 0700, and that is what makes TLS on this
+# volume possible at all.** The AppArmor profile attaches to /usr/sbin/bao and grants no capability, so
+# a confined `bao` run by root cannot traverse a directory owned by 65532 and moded 0700 -- the exact
+# failure /etc/openbao is shaped to avoid, where `bao status` could not read its own CA. Root owns the
+# mountpoint and the openbao group reads it; Raft gets a subdirectory of its own that it does own.
+#
+# TLS lives here too, and is the reason any of this moved. On the boot disk it did not survive the
+# Droplet, so replacing a node meant copying a key back before OpenBao could start. Here it reattaches
+# with the volume. Root-owned with group read, so OpenBao can read its own certificate and cannot
+# rewrite it. The seal key deliberately stays on the boot disk: it is what makes a snapshot of THIS
+# volume useless on its own, and moving it here would put the ciphertext and its key on one disk.
+#
+# Idempotent, so this is safe on every start.
+create_layout() {
+	install -d -o root -g 65532 -m 0750 /var/lib/openbao
+	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao/data
+	install -d -o root -g 65532 -m 0750 /var/lib/openbao/tls
+}
+
 start() {
+	# The deliberate single-Droplet case, and the only way to run this image without an attached volume.
+	#
+	# The default refuses to guess, and it should: OpenBao writing its Raft store to the Droplet's own
+	# disk while an attached volume sits empty is silent and destroys the store, so a node that cannot
+	# find its volume must not start. But "must not start by ACCIDENT" is the property that is worth
+	# having, and refusing outright also rules out a legitimate arrangement -- one Droplet, no block
+	# storage, backups taken with snapshots -- which for an image other people boot is a lock-in rather
+	# than a safeguard.
+	#
+	# `RAFT_DEVICE="none"` is that arrangement, stated. It cannot be reached by a volume failing to
+	# attach or by a device name changing, only by someone writing it in /etc/conf.d/openbao-volume, so
+	# the accident this service exists to prevent is still prevented. The warning is deliberately loud
+	# and repeats on every boot: the store then lives on a disk that does not survive the Droplet.
+	if [ "${RAFT_DEVICE:-}" = "none" ]; then
+		ewarn "RAFT_DEVICE=none: the Raft store is on the Droplet's own disk, not an attached volume."
+		ewarn "It does not survive this Droplet. Snapshot the Droplet, or attach a volume and unset this."
+		create_layout
+		return 0
+	fi
+
 	if mountpoint -q /var/lib/openbao; then
 		einfo "Raft volume already mounted"
+		create_layout
 		return 0
 	fi
 
@@ -85,23 +127,8 @@ start() {
 	fi
 
 	# Applied after the mount, not before: it has to land on the mounted filesystem rather than on the
-	# empty directory underneath it. Idempotent, so this is safe on every start.
-	#
-	# **The mountpoint is root:openbao 0750, not 65532:65532 0700, and that is what makes TLS on this
-	# volume possible at all.** The AppArmor profile attaches to /usr/sbin/bao and grants no capability, so
-	# a confined `bao` run by root cannot traverse a directory owned by 65532 and moded 0700 -- the exact
-	# failure /etc/openbao is shaped to avoid, where `bao status` could not read its own CA. Root owns the
-	# mountpoint and the openbao group reads it; Raft gets a subdirectory of its own that it does own.
-	install -d -o root -g 65532 -m 0750 /var/lib/openbao
-	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao/data
-
-	# TLS, and the reason any of this moved. On the boot disk it did not survive the Droplet, so replacing
-	# a node meant copying a key back before OpenBao could start. Here it reattaches with the volume.
-	#
-	# root-owned with group read, so OpenBao can read its own certificate and cannot rewrite it. The seal
-	# key deliberately stays on the boot disk: it is what makes a snapshot of THIS volume useless on its
-	# own, and moving it here would put the ciphertext and its key on one disk.
-	install -d -o root -g 65532 -m 0750 /var/lib/openbao/tls
+	# empty directory underneath it. See create_layout above for what each mode buys.
+	create_layout
 }
 
 stop() {
