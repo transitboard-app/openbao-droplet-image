@@ -270,3 +270,59 @@ belongs where it was made: in the test harness. Nothing about the image needs to
 One gap this exposed in the work above: the self-check printed its boot time to the serial console and
 nowhere else, so on a node that was up and reachable there was no way to ask what its boot had cost.
 It now goes to syslog as well.
+
+## Integration, on real infrastructure
+
+The two paths every previous audit listed as untested, closed the same day as the Droplet boot. Both ran
+against a `s-1vcpu-1gb` appliance in `lon1`, a managed PostgreSQL 17, and a single-node DOKS cluster in
+the same VPC. Everything was destroyed afterwards.
+
+### The database secrets engine mints against a real PostgreSQL
+
+Configured with `sslmode=verify-full`, a role created, and a credential minted with a one-hour renewable
+lease. The credential was then used to log in to the database from a pod, which reported itself as
+`v-root-app-…` and confirmed exactly one dynamic role existed. **Zero AppArmor denials** — the engine
+loads in-process and the profile's blanket exec denial is not in its way, which had been assumed and is
+now measured.
+
+**`ca-certificates` does not verify a DigitalOcean managed database, and `image/packages` claimed it
+did.** DigitalOcean signs them with a per-project private CA — `CN=<project-uuid> Project CA` — so the
+first attempt failed with `x509: certificate signed by unknown authority`. The correct configuration
+installs the project CA on the node and names it with `sslrootcert=`. The entry has been rewritten to
+say so, because the alternative an operator reaches for is `sslmode=require`, which verifies nothing on
+the connection that mints database credentials.
+
+**Operator-supplied files must live under `/etc/openbao`.** `bao write ... @/tmp/k8s-ca.crt` was denied:
+the profile attaches to the binary, confines the CLI, and grants no read on `/tmp`. It is the same shape
+as a Raft snapshot not being writable on the node, and it produced the only AppArmor denial recorded all
+day — one that was deliberately provoked.
+
+### A pod reaches OpenBao only once the route is installed
+
+This is D20, reproduced and then fixed on real infrastructure rather than argued about.
+
+```
+pod -> https://10.106.0.5:8200/v1/sys/health        HTTP 000     (no route)
+echo "10.107.0.0/25 10.106.0.7" > /etc/openbao/pod-routes
+rc-service openbao-pod-routes restart               10.107.0.0/25 via 10.106.0.7 dev eth1
+pod -> https://10.106.0.5:8200/v1/sys/health        HTTP 200
+```
+
+The Droplet's routing table before showed exactly the described failure: `default via <public gateway>
+dev eth0` and nothing for the pod range, so replies went out the public interface and vanished.
+
+**Pod traffic is not masqueraded**, which is the premise the whole mechanism rests on and had never been
+checked: the audit log records `remote_address` of `10.107.0.30` and `10.107.0.47` — pod addresses, not
+the node's. That also retroactively justifies `net.ipv4.conf.all.rp_filter=2`; strict mode would drop
+those packets silently.
+
+### The Agent works, from a sidecar
+
+The real `bao agent` ran as an init container — which is precisely what the injector injects — with
+`auto_auth` against the Kubernetes method and a `template` stanza. It authenticated with the pod's
+service account, wrote its token to a sink and templated the secret to a shared volume, and the
+application container read `minted-through-kubernetes-auth` out of it. A path the policy did not grant
+returned 403.
+
+Nothing about Agent injection needs anything from this image that was not already there. What needed
+proving was the network path and the auth method, and both hold.

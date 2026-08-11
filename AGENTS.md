@@ -113,6 +113,26 @@ that turns off certificate verification on the host holding every production cre
 rather than hard-coded, so it stays right for a node whose operator moved the files or uses ACME. It is
 sourced by login shells only; `ssh <node> <command>` runs a non-login shell and does not get it.
 
+**A file handed to `bao write ... @path` must live under `/etc/openbao`, and `ca-certificates` does not
+verify a DigitalOcean managed database.** Two findings from the first real integration, and both look
+like bugs in something else when you hit them.
+
+The profile grants no read on `/tmp`, so `scp`ing a CA there and writing it into a configuration answers
+`permission denied` on a file that is plainly present — measured, configuring the Kubernetes auth
+method. Put operator-supplied material under `/etc/openbao`, which the profile grants `r`.
+
+And DigitalOcean signs managed databases with a per-project private CA, not a public one, so
+`sslmode=verify-full` against the shipped bundle fails with `x509: certificate signed by unknown
+authority`. The fix is `doctl databases get-ca` into `/etc/openbao/postgres-ca.crt` and `sslrootcert=`
+in the connection string — **not** `sslmode=require`, which would verify nothing on the connection that
+mints database credentials. `image/packages` used to claim `ca-certificates` covered this; it does not.
+
+**Pod traffic arrives un-masqueraded, which is why `openbao-pod-routes` and `rp_filter=2` both exist.**
+Measured on DOKS: OpenBao's audit log records pod-CIDR source addresses (`10.107.0.30`), not the node's.
+A pod could not reach the Droplet at all until the return route was installed — `HTTP 000` before,
+`HTTP 200` after. Strict reverse-path filtering would drop those packets silently, which is exactly the
+symptom D20 spent two wrong fixes chasing.
+
 **The AppArmor profile confines the CLI as well as the server, because a profile attaches to a path.**
 `profile openbao /usr/sbin/bao` covers every execution of that binary, including the one an operator
 types. This is not a mistake to fix by adding a second unconfined path — it is a property to design
@@ -223,5 +243,7 @@ signal path it depends on. Do not remove either without replacing what it does.
   sysfs, OpenBao initialised, unsealed, served and rebooted with the store intact, and zero AppArmor
   denials. What the lab still does not reproduce is the timing — it is TCG, an order of magnitude out —
   so treat a boot measured there as useful only against another boot on the same host.
-- No credential has been minted against a real PostgreSQL instance, and Agent injection from a cluster
-  is still unexercised. Those are the remaining untested paths, not the platform.
+- **Both remaining paths are now exercised on real infrastructure.** A dynamic PostgreSQL credential was
+  minted against a managed database and used to log in; a pod in a DOKS cluster authenticated through
+  the Kubernetes auth method and read a secret, with the real Agent doing it from an init container.
+  Zero AppArmor denials against the server across all of it.

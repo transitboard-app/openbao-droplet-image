@@ -405,6 +405,43 @@ needs, but two things follow from it and neither is a bug:
   which is the reason the tunnel exists. See `documentation/openbao-operations.md` in stack for retention
   and restore testing.
 
+### Files you give OpenBao must live under `/etc/openbao`
+
+The AppArmor profile attaches to `/usr/sbin/bao`, so it confines the CLI you type as well as the
+server, and it grants no read on `/tmp` or `/root`. Anything you hand to `bao write ... @file` —
+a database CA, a Kubernetes CA, a token-reviewer JWT — has to be somewhere the profile allows:
+
+```bash
+install -d -o root -g openbao -m 0750 /etc/openbao/kubernetes
+install -o root -g openbao -m 0640 ca.crt /etc/openbao/kubernetes/ca.crt
+```
+
+`scp` it to `/tmp` first and the write fails with `permission denied` on a file that is plainly there,
+which reads as a bug and is the profile doing its job. It is the same shape as a Raft snapshot not being
+writable on the node.
+
+### Databases: DigitalOcean signs managed clusters with a private CA
+
+The image ships `ca-certificates`, and it does **not** verify a DigitalOcean managed database. Those
+carry a per-project CA (`CN=<project-uuid> Project CA`), so `sslmode=verify-full` against the public
+bundle fails with `x509: certificate signed by unknown authority` — measured against a real managed
+PostgreSQL 17. Install the project CA and name it:
+
+```bash
+doctl databases get-ca <database-id> | sed -n '/BEGIN/,/END/p' > postgres-ca.crt
+scp postgres-ca.crt root@<node>:/etc/openbao/postgres-ca.crt
+ssh root@<node> 'chown root:openbao /etc/openbao/postgres-ca.crt && chmod 0640 /etc/openbao/postgres-ca.crt'
+```
+
+```bash
+bao write database/config/pg plugin_name=postgresql-database-plugin allowed_roles=app \
+  connection_url='postgresql://{{username}}:{{password}}@HOST:25060/defaultdb?sslmode=verify-full&sslrootcert=/etc/openbao/postgres-ca.crt' \
+  username=doadmin password=...
+```
+
+Do not reach for `sslmode=require` to make the error go away: it encrypts and verifies nothing, on the
+connection that mints your database credentials.
+
 ### Logs
 
 `audit.log`, `stdout.log` and `stderr.log` live in `/var/log/openbao` on the Droplet's own disk, not on
@@ -489,11 +526,15 @@ still immediate, so the 13.9-second entropy stall that the QEMU boot test used t
 of the lab and not something a Droplet pays.
 
 ### Still unsettled
-- **No credential has been minted against a real PostgreSQL instance.** The database secrets engine was
-  shown to load in-process — it does not fork, so the profile's blanket exec denial is not a problem —
-  and to reach `connect()`, but no database was stood up behind it.
-- **Agent sidecar injection from a Kubernetes cluster is unexercised**, as is real traffic over the pod
-  routes. `openbao-pod-routes` installs a route; nothing has come back along one.
+- ~~No credential minted against a real PostgreSQL~~ — **done.** A managed PostgreSQL 17, the database
+  secrets engine configured with `verify-full` against DigitalOcean's project CA, a dynamic credential
+  minted with an hour lease, and that credential used to log in and query. Zero AppArmor denials.
+- ~~Agent injection and pod routes unexercised~~ — **done.** A DOKS cluster in the same VPC: a pod could
+  not reach OpenBao at all (`HTTP 000`) until `openbao-pod-routes` installed
+  `10.107.0.0/25 via <node>`, after which it answered `HTTP 200`. The real OpenBao Agent then ran as an
+  init container — which is exactly what the injector injects — authenticated with its service account,
+  templated the secret to a shared volume, and the application container read it. A denied path
+  correctly returned 403.
 - `mitigations=auto,nosmt` is still not on the kernel command line. It can prevent boot and has not been
   tested here; add it on its own, with a boot test.
 - **There is no way to log in at the console, by construction.** Root's password field is `*`, there is

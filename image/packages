@@ -62,8 +62,20 @@ apparmor-profiles-tunables
 e2fsprogs-extra
 sfdisk
 
-# OpenBao dials the managed PostgreSQL instance over TLS to mint leased logins, and verifies its
-# certificate against these.
+# The public trust store, for any TLS endpoint OpenBao dials that a public CA signed -- ACME's
+# directory if a node uses it, and an external service with an ordinary certificate.
+#
+# **It is NOT what verifies a DigitalOcean managed database, and this entry used to say it was.**
+# Measured against a real managed PostgreSQL 17: DigitalOcean signs those with a per-project private CA
+# (`CN=<project-uuid> Project CA`), so `sslmode=verify-full` against this bundle fails with
+# `x509: certificate signed by unknown authority`. The database secrets engine works perfectly once the
+# project CA is on the node and the connection string names it:
+#
+#   doctl databases get-ca <id> > /etc/openbao/postgres-ca.crt   # root:openbao 0640
+#   connection_url=...?sslmode=verify-full&sslrootcert=/etc/openbao/postgres-ca.crt
+#
+# It has to be under /etc/openbao, not /tmp: the AppArmor profile confines the CLI as well as the
+# server and grants no read on /tmp, so `bao write ... @/tmp/ca.crt` is denied. See README.md.
 ca-certificates
 
 # Clock discipline. Not optional on this host specifically: every credential OpenBao issues is a
