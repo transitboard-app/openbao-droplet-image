@@ -61,6 +61,14 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
   # whole point of writing it.
   deny /var/lib/openbao/tls/** w,
 
+  # The seal key, denied for writing on the same reasoning and made audible.
+  #
+  # `/etc/openbao/** r` above grants no write, so this overrides nothing and forbids nothing that was
+  # not already forbidden -- what it adds is that an attempt is LOGGED rather than silently refused.
+  # This is the one file on the node that decrypts the Raft store, so a process trying to write it is
+  # something an operator needs to find in dmesg, not a denial by omission that leaves no trace.
+  audit deny /etc/openbao/seal/** w,
+
   # The audit log, on the Droplet's own disk rather than the Raft volume. OpenBao refuses requests when
   # every audit device fails to write, so an audit log that filled the Raft volume would take the
   # service down -- separate filesystems keep log growth from becoming an outage.
