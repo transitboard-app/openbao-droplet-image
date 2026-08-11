@@ -25,6 +25,7 @@ none. On macOS this directory has no tasks at all. Do not add a `mise.toml` to "
 | `image/setup.sh` | what happens inside the chroot: users, kernel command line, services |
 | `image/overlay/` | files copied into the image verbatim |
 | `scripts/verify-image` | offline assertions against a built image, and the package manifest |
+| `documentation/` | point-in-time audits; the standing guidance is this file and `README.md` |
 | `.github/workflows/` | the manual release pipeline |
 
 ## The things most likely to be got wrong
