@@ -9,7 +9,22 @@
 # Break-glass access, and the transport for both of stack's tunnels. `openbao:tunnel` and `db:tunnel`
 # are `ssh -L` port forwards through this node, so sshd is load-bearing operations tooling rather than
 # a convenience -- see the AllowTcpForwarding note in overlay/etc/ssh/sshd_config.d/10-appliance.conf.
-openssh
+#
+# The SERVER, not the `openssh` meta-package, and the difference is 2.2 MiB of client the appliance
+# never runs. `openssh` pulls in openssh-client-default: ssh, scp, sftp, ssh-add, ssh-agent,
+# ssh-keyscan, ssh-copy-id and ssh-pkcs11-helper. Every SSH session this node takes part in is inbound
+# -- the tunnels are `ssh -L` from an operator's machine, and the client runs there -- so the whole
+# suite is surface with no caller. Dropping it also orphans libedit, which only `sftp` linked.
+#
+# openssh-keygen comes as a dependency and is required, not incidental: sshd's init script runs
+# `ssh-keygen -A` on first boot, which is what keeps this image from shipping a host key every Droplet
+# built from it would share.
+openssh-server
+# `scp` is the documented way TLS material reaches the node, and OpenSSH 9 and later run scp over the
+# SFTP protocol rather than the legacy rcp one. Without this subpackage the server has no sftp
+# subsystem and the first-boot procedure in README.md fails with a message about the subsystem request,
+# which reads as an sshd misconfiguration rather than a missing file.
+openssh-sftp-server
 
 # DigitalOcean's metadata contract: SSH keys, hostname, networking, root filesystem expansion.
 # tiny-cloud rather than cloud-init, measured at 5 MiB against 62 MiB -- cloud-init drags in a whole
@@ -38,6 +53,12 @@ apparmor-profiles-tunables
 
 # resize2fs and sfdisk, for growing the root filesystem into the Droplet's disk on first boot. The
 # image is 1 GiB and the smallest Droplet has 25 GiB.
+#
+# resize2fs is in `-extra` rather than in base e2fsprogs -- checked against the v3.24 package, because
+# the reverse is the obvious guess and it is wrong. The subpackage carries nineteen other tools with
+# it, and image/setup.sh deletes the ones this appliance has no caller for. `debugfs` is the one that
+# matters: it is a raw ext2/3/4 editor that reads and writes blocks directly, so on this host it is a
+# way to read the Raft volume around every file permission on it.
 e2fsprogs-extra
 sfdisk
 
@@ -52,4 +73,10 @@ chrony
 
 # `ip route replace`, which busybox's applet does not implement. stack's D20 fix writes one route per
 # worker node onto this Droplet; without it, pods reach OpenBao and the replies are dropped.
-iproute2
+#
+# `-minimal`, which is the subpackage that owns /sbin/ip -- checked against the installed image, not
+# assumed. The plain `iproute2` meta-package adds iproute2-tc, iproute2-ss, /sbin/bridge, /sbin/genl,
+# /sbin/rtmon and libxtables on top of it, none of which anything here calls: `tc` is a traffic-shaping
+# language, `bridge` and `genl` configure things this node does not have, and libxtables is linked only
+# by tc. The `ip` binary is the same file either way, so `ip route replace` is unaffected.
+iproute2-minimal

@@ -23,6 +23,11 @@ install -m 0755 -o root -g root /mnt/bao /usr/sbin/bao
 # the checksum of what actually shipped.
 install -m 0644 -o root -g root /mnt/provenance /etc/openbao-binary-provenance
 
+# What built this image: the commit of the recipe, the Alpine branch, the OpenBao version and the date.
+# A qcow2 carries no metadata, so for an artifact other people download this file is the only way to ask
+# an image where it came from. Written by the stage:manifest task; see mise.linux-x64.toml.
+install -m 0644 -o root -g root /mnt/release /etc/openbao-appliance-release
+
 # Deliberately NOT setcap'd, and now not granted any capability at all. This carried CAP_IPC_LOCK for
 # mlock until a live Droplet showed OpenBao 2.x has dropped mlock support; see /etc/init.d/openbao.
 # Leaving the binary untouched also keeps it byte-identical to upstream's apart from the strip recorded
@@ -353,26 +358,100 @@ wc -l < /etc/openbao-appliance-packages | xargs echo "    packages installed:"
 echo "==> removing what the appliance does not run"
 # Each of these is measured by scripts/verify-image rather than assumed, because every one of them is
 # the kind of thing that quietly reappears when a package is added.
+#
+# Removed by reading apk's own database rather than by listing paths here, and that is not a style
+# choice. Every package below is a hard dependency of something the appliance genuinely needs, so
+# `apk del` refuses and an `rm` is the only route -- and a hand-written list of paths is how you delete
+# /bin/bbsuid and take `mount` with it, which is a mistake this image has already made once. apk
+# records every file it installed, symlinks included; this removes exactly those and nothing else.
+#
+# It also writes its own record. The note appended to /etc/openbao-appliance-packages used to be a
+# hand-maintained heredoc listing what had been force-removed, which is a list that drifts the first
+# time somebody adds a removal and forgets the second edit. Now the record is produced by the removals.
+removed_note=/tmp/removed-note
+: > "$removed_note"
+
+purge() {
+	reason="$1"
+	shift
+	# Reason first, then the packages indented under it. Columns were tried and do not survive a list of
+	# eight package names; this file is read by somebody working out what was on a node during an
+	# incident, so it has to stay legible however long the list gets.
+	printf '#   %s:\n#       %s\n' "$reason" "$*" >> "$removed_note"
+	for package in "$@"; do
+		awk -v want="$package" '
+			/^P:/ { name = substr($0, 3) }
+			/^F:/ { dir = substr($0, 3) }
+			/^R:/ { if (name == want) print "/" dir "/" substr($0, 3) }
+		' /lib/apk/db/installed |
+			while IFS= read -r file; do
+				rm -f "$file"
+			done
+	done
+}
 
 # Python, pulled in by `apparmor` as a hard dependency for its aa-* helper scripts. The appliance uses
 # none of them: /etc/init.d/apparmor is a plain OpenRC shell script, and apparmor_parser is a C binary
 # that runs fine without an interpreter (verified before this line was written). Leaving it would put a
 # 60 MiB scripting runtime on the host holding every production credential, which is the exact thing
 # choosing tiny-cloud over cloud-init avoided.
-rm -rf /usr/bin/python3* /usr/lib/python3* /usr/lib/libpython3* 2>/dev/null || true
-
-# Python's dependency closure, orphaned by the line above and left behind because that is an `rm` rather
-# than an `apk del` -- apk would refuse, since `apparmor` declares python3 as a hard dependency.
 #
-# Measured after the fact: nothing in the image references libsqlite3 or libmpdec at all. libstdc++ is
-# NOT in this list and must not be: apparmor_parser links it, and removing it takes AppArmor with it.
-rm -f /usr/lib/libsqlite3.so* /usr/lib/libmpdec*
-# /usr/bin/python is a symlink to python3 and is left dangling by the line above. Harmless in itself,
-# but verify-image rejects dangling symlinks wholesale -- the check exists because deleting a binary
-# that other names point at is exactly how `mount` went missing once.
-rm -f /usr/bin/python
+# The dependency closure goes with it. This used to remove libsqlite3 and libmpdec and stop there, which
+# left libffi, libgdbm, libgdbm_compat, libpanelw, libreadline and libexpat on the image -- an XML
+# parser and a database library on an appliance with nothing to call them, kept alive only by the fact
+# that nobody had scanned for what still linked them. Nothing does; checked with a NEEDED scan over
+# every ELF file in the image.
+#
+# libstdc++ is NOT in this list and must not be: apparmor_parser links it, and removing it takes
+# AppArmor with it. libncursesw is not either: sfdisk links it, and root expansion needs sfdisk.
+purge "a hard dependency of apparmor, used only by its aa-* helper scripts" \
+	python3 python3-pyc pyc python3-pycache-pyc0
+purge "python's dependency closure, with nothing left to link it" \
+	sqlite-libs mpdecimal libffi gdbm libpanelw readline libexpat
+rm -rf /usr/lib/python3*
 /sbin/apparmor_parser --version >/dev/null 2>&1 || {
 	echo "FATAL: apparmor_parser stopped working after removing Python" >&2
+	exit 1
+}
+
+# The tools that put a bootloader on this disk, on a disk that already has one. `syslinux` is installed
+# by alpine-make-vm-image to run `extlinux --install`, so it cannot be left out of the package list --
+# it is genuinely needed while the image is being built and is dead the moment it is. What remains is a
+# bootloader installer, a FAT filesystem editor (mtools) and an ISO rewriter on the host holding every
+# production credential. `/usr/share/syslinux`, the payload, was already being removed here; the
+# binaries that install it were not.
+#
+# isohybrid.pl goes with them, and it is worth naming: a Perl script, on an image whose verify step
+# asserts there is no interpreter. There is no perl to run it, so it was inert -- but the check looks
+# for /usr/bin/perl and would not have found this.
+purge "a bootloader installer, on a disk whose bootloader is installed" syslinux mtools
+rm -rf /usr/share/syslinux
+
+# e2fsprogs-extra, cut to the one tool that has a caller.
+#
+# resize2fs is in this subpackage rather than in base e2fsprogs, so it has to be installed -- and it
+# arrives with nineteen other tools. `debugfs` is why this block exists rather than being left as
+# untidiness: it is a raw ext2/3/4 editor that reads and writes blocks directly, which on this host is a
+# way to read the Raft volume around every file permission protecting it, and to write it around the
+# AppArmor profile that stops OpenBao itself doing so. It is a fully general filesystem shell on a
+# machine that ships no shell.
+#
+# Measured rather than assumed: the only tool tiny-cloud calls is `resize2fs`, at
+# /usr/lib/tiny-cloud/init:86. The `debugfs` hits elsewhere in /etc/init.d are the KERNEL filesystem of
+# that name being mounted by OpenRC's sysfs script, not this binary -- which is exactly the kind of
+# thing a grep count would have got wrong. chattr and lsattr stay: /etc/init.d/bootmisc calls chattr.
+for dead_tool in debugfs badblocks e2image e2undo e4crypt e4defrag e2freefrag filefrag \
+	e2scrub e2scrub_all e2mmpstatus mklost+found logsave dumpe2fs e2label; do
+	rm -f "/usr/sbin/$dead_tool"
+done
+printf '#   %s:\n#       %s\n' \
+	"raw filesystem editors with no caller; debugfs reads the Raft volume around its permissions" \
+	"e2fsprogs-extra (all but resize2fs, chattr, lsattr)" >> "$removed_note"
+# libss is debugfs's command-line library and libreadline was linked by nothing else, which is how a
+# 292 KiB line editor outlived the interpreter it came in for.
+rm -f /usr/lib/libss.so*
+test -x /usr/sbin/resize2fs || {
+	echo "FATAL: resize2fs was removed; the root filesystem could not grow into the Droplet's disk" >&2
 	exit 1
 }
 
@@ -430,6 +509,7 @@ modules="/lib/modules/$release/kernel"
 for dead in sound drivers/gpu drivers/usb drivers/md drivers/hid drivers/input \
             drivers/target drivers/message drivers/xen drivers/bluetooth \
             drivers/nvme/target drivers/vhost drivers/vdpa drivers/hv \
+            drivers/cdrom drivers/nvdimm drivers/rpmsg \
             arch/x86/kvm \
             net/netfilter net/sched net/sunrpc net/ceph net/sctp net/bridge net/9p \
             net/key net/llc net/802 net/vmw_vsock net/l2tp net/openvswitch \
@@ -437,13 +517,140 @@ for dead in sound drivers/gpu drivers/usb drivers/md drivers/hid drivers/input \
 	rm -rf "${modules:?}/$dead"
 done
 
+# Cut a module directory down to the modules named, AND everything they depend on.
+#
+# **The dependency closure is the whole point, and leaving it out cost a boot.** The first version of
+# this kept `virtio_net.ko*` by name and deleted the rest of drivers/net, which is correct right up
+# until you learn that virtio_net depends on net_failover, which lives in that same directory. The
+# image built, every offline check passed -- including one asserting virtio_net was still there -- and
+# the node came up with `Cannot find device "eth0"`, no network, and therefore no metadata, no SSH and
+# no OpenBao. A module is not kept by keeping its file; it is kept by keeping what it loads with.
+#
+# modules.dep already knows, so it is read rather than guessed. This runs before depmod deliberately:
+# the dependency data has to come from the tree as the kernel package shipped it, not from an index
+# regenerated over a tree that has already had things taken out of it.
+prune_modules() {
+	tree="$1"
+	shift
+	keep=""
+	for wanted in "$@"; do
+		# The line for this module, whose form is "<path>: <dependency path> <dependency path> ...".
+		# Both sides are wanted, so the colon becomes a separator and the whole line is taken.
+		dependency_line="$(grep -m1 "/$wanted\.ko" "/lib/modules/$release/modules.dep" || true)"
+		[ -n "$dependency_line" ] || {
+			echo "FATAL: $wanted is not in modules.dep; the prune would remove it" >&2
+			exit 1
+		}
+		for path in $(printf '%s' "$dependency_line" | tr ':' ' '); do
+			keep="$keep ${path##*/}"
+		done
+	done
+
+	find "$modules/$tree" -type f -name '*.ko*' | while IFS= read -r module_file; do
+		case " $keep " in
+		*" ${module_file##*/} "*) ;;
+		*) rm -f "$module_file" ;;
+		esac
+	done
+	find "$modules/$tree" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+}
+
+# Every network driver except virtio_net and what it loads with, which is 3.2 MiB and the largest
+# single tree left.
+#
+# A Droplet's NIC is virtio, so what this removes is drivers for hardware that cannot be attached to
+# this machine -- 1.9 MiB of physical NIC drivers alone, Mellanox and Intel and the cloud vendors' own.
+# The rest is the interesting part and the reason this is a security change before a size one: bonding,
+# team, vxlan, macsec, ipvlan, ppp, slip, wireguard, ovpn and tun are encapsulation and tunnel drivers,
+# each one a parser the kernel will autoload the moment something asks for that link type. None of them
+# has a caller here; this node routes plain IP over virtio and nothing else.
+#
+# The same bet as `drivers/nvme/host` being kept, made in the other direction and worth saying so: that
+# one hedges against DigitalOcean changing its storage presentation, this one does not hedge against it
+# changing its network presentation. The boot test is what makes that safe to assert -- it boots against
+# virtio-net-pci and the node is unreachable if this is ever wrong, which is not hypothetical: that is
+# how the missing net_failover above was found.
+prune_modules drivers/net virtio_net
+
+# The SCSI tree, cut to what reaches a DigitalOcean volume: virtio_scsi for the transport and sd_mod for
+# the disk, plus their dependencies. `scsi_mod` is builtin in linux-virt, so it is not in here to keep.
+#
+# What goes is every other transport the kernel could bind: iSCSI, Fibre Channel, SAS, SRP, SPI, the LSI
+# Fusion driver, Xen and Hyper-V storage fronts. `sg` goes with them and is the one to notice -- SCSI
+# generic passes arbitrary SCSI commands straight to a device, which on this host means straight to the
+# disk holding the Raft store. `sr_mod` is the CD-ROM driver, on a machine with no optical drive.
+prune_modules drivers/scsi virtio_scsi sd_mod
+
 # Every filesystem except the one this appliance uses. ext4 needs jbd2 and mbcache beside it.
 find "$modules/fs" -mindepth 1 -maxdepth 1 \
 	! -name ext4 ! -name jbd2 ! -name 'mbcache*' -exec rm -rf {} + 2>/dev/null || true
 
 # modules.dep still describes what was deleted, and a stale dependency file makes modprobe fail in a way
 # that reads as a missing driver rather than a stale index.
-depmod -a "$release"
+#
+# Its warnings are an error here, not noise. `depmod` reports a module left with a dependency that is no
+# longer on disk as `needs unknown symbol`, and that is precisely the state a prune produces when it
+# takes something out from under a module it meant to keep -- so the one tool that can see the mistake
+# is made to fail on it. Nothing else can: the file is present, every offline check finds it, and the
+# module simply refuses to load at boot.
+depmod_warnings="$(depmod -a "$release" 2>&1 || true)"
+if [ -n "$depmod_warnings" ]; then
+	echo "FATAL: the module prune left unresolved dependencies:" >&2
+	printf '%s\n' "$depmod_warnings" >&2
+	exit 1
+fi
+
+# And the same question asked directly of the modules this appliance cannot boot without: every path on
+# their modules.dep line has to still exist. depmod's warnings cover a module that lost a symbol; this
+# covers one that lost a whole dependency file, which is what happened to virtio_net.
+for critical in virtio_net virtio_blk virtio_scsi sd_mod ext4; do
+	dependency_line="$(grep -m1 "/$critical\.ko" "/lib/modules/$release/modules.dep" || true)"
+	[ -n "$dependency_line" ] || {
+		echo "FATAL: $critical is gone from modules.dep; this node would boot without it" >&2
+		exit 1
+	}
+	for path in $(printf '%s' "$dependency_line" | tr ':' ' '); do
+		[ -f "/lib/modules/$release/$path" ] || {
+			echo "FATAL: $critical needs $path, which the module prune removed" >&2
+			exit 1
+		}
+	done
+done
+
+# **The initramfs is generated when the kernel package is installed, which is before this script runs.**
+# So every module pruned above was still inside it, and the image's central claim about modules -- that
+# one which is not on disk cannot be loaded -- was true of the root filesystem and false of the boot
+# medium sitting beside it. Measured on the built image: 1.4 MiB of GPU drivers, 724 KiB of USB, 228 KiB
+# of RAID, 184 KiB of HID and the whole filesystem tree, all present in /boot/initramfs-virt after
+# setup.sh had removed them from /lib/modules, and all of it loadable by the initramfs before
+# switch_root ever happens.
+#
+# Regenerating here, after the prune, is what makes the two agree. mkinitfs reads the same feature list
+# it was configured with (base ext4 scsi virtio) and copies what those globs still match, so this needs
+# no separate list to keep in step -- the prune above is the single source of truth and this follows it.
+#
+# Asserted rather than trusted, because an initramfs missing virtio_blk or ext4 is an image that cannot
+# mount its own root and says nothing until it is booted.
+mkinitfs -o /boot/initramfs-virt "$release" 2>&1 | grep -Fv 'cannot open device /dev' || true
+for required in virtio_blk ext4 virtio_scsi; do
+	gzip -dc /boot/initramfs-virt | cpio -it 2>/dev/null | grep -q "$required" || {
+		echo "FATAL: the regenerated initramfs has no $required; this image cannot mount its root" >&2
+		exit 1
+	}
+done
+echo "    initramfs: $(( $(stat -c %s /boot/initramfs-virt) / 1024 )) KiB after pruning"
+
+# The initramfs toolchain, which exists to produce the file above and has now produced it. Nothing on a
+# running node regenerates an initramfs, because nothing on a running node updates a kernel -- there is
+# no package manager to do it with, and a security update here means a new image and a new Droplet.
+#
+# This is where cryptsetup and device-mapper leave the appliance. They are on it because mkinitfs links
+# libcryptsetup for `nlplug-findfs`, the initramfs's device finder, so an image that mounts one plain
+# ext4 filesystem was carrying a full disk-encryption and device-mapper stack for a program that only
+# ever runs inside an initramfs. lddtree, scanelf, yx and libyaml are mkinitfs's own build-time helpers.
+purge "the initramfs toolchain, after the initramfs it builds" \
+	mkinitfs lddtree scanelf yx yaml cryptsetup-libs device-mapper-libs json-c
+rm -rf /usr/share/mkinitfs /etc/mkinitfs
 
 # The kernel symbol map, which exists to decode an oops on a machine with a debugger attached. This one
 # sets ptrace_scope=3 and has no debugger, and the file is 6.1 MiB.
@@ -455,10 +662,29 @@ rm -f /boot/System.map-*
 # looked like before it was hardened.
 rm -f /boot/config-* /boot/extlinux.conf.old
 
-# syslinux's installable payload, 3.5 MiB. extlinux has already been installed into /boot by this point,
-# so what is left is the source material for an installation that has happened.
-rm -rf /usr/share/syslinux
+# The package record above was written while apk still worked, so it lists what apk installed rather
+# than what survives on the running node. Every removal in this section is a force-deletion rather than
+# an `apk del` -- each is a hard dependency of something the appliance does need -- so apk's database
+# still believes those files are present. Recording the difference is what keeps the file honest for an
+# incident response, which on an image with no package manager has nothing else to read.
+#
+# Written from the note the removals produced, not from a list maintained beside them.
+{
+	echo
+	echo "# Force-removed after installation; apk's database above still lists them as installed:"
+	cat "$removed_note"
+	printf '#   %s:\n#       %s\n' \
+		"the setuid bit removed, the binary left in place; nothing runs as a non-root human" \
+		"busybox-suid (/bin/bbsuid)"
+	printf '#   %s:\n#       %s\n' \
+		"removed last; this image is replaced, never patched in place" \
+		"apk-tools (/sbin/apk, libapk, /usr/share/apk)"
+} >> /etc/openbao-appliance-packages
 
+# After the record is written, not before: the note lives in /tmp and this wipes it. Doing these two in
+# the other order cost a build -- the record read a file that had just been deleted, setup.sh died, and
+# `build:assert` refused the half-hardened image on the strength of its missing stamp, which is exactly
+# the failure that check was added for.
 rm -rf /var/cache/apk/* /tmp/* 2>/dev/null || true
 
 # apk itself, last, because everything above needed it.
@@ -468,20 +694,14 @@ rm -rf /var/cache/apk/* /tmp/* 2>/dev/null || true
 # intended operating model, and it is the reason /etc/openbao-appliance-packages is written above --
 # with no package manager, that file is the only record of what is installed.
 #
-# /lib/apk/db is deliberately kept: it is readable without apk and is what an incident response needs.
-rm -f /sbin/apk
-
-# The package record above was written while apk still worked, so it lists what apk installed rather
-# than what survives on the running node. The three removals are force-deletions rather than `apk del`
-# (each is a hard dependency of something the appliance does need), so apk's database still believes
-# they are present. Recording the difference is what keeps the file honest for an incident response.
-cat >> /etc/openbao-appliance-packages <<'REMOVED'
-
-# Force-removed after installation; apk's database above still lists them as installed:
-#   python3, python3-pyc, pyc  -- a hard dependency of `apparmor`, used only by its aa-* helper scripts
-#   busybox-suid (/bin/bbsuid) -- the setuid helper; nothing here runs as a non-root human
-#   apk-tools (/sbin/apk)      -- removed last; this image is replaced, never patched in place
-REMOVED
+# The library goes with the binary. Removing /sbin/apk and leaving libapk.so behind is half the job:
+# what makes this appliance immutable is that there is no code on it that can install a package, and a
+# shared object that does exactly that is code whether or not the front end is still there.
+#
+# /lib/apk/db is deliberately kept: it is data rather than code, it is readable without apk, and it is
+# what an incident response reads to find out what was on the node.
+rm -f /sbin/apk /usr/lib/libapk.so*
+rm -rf /usr/share/apk
 
 # Zero the free space, which does two things and the second matters more than the first.
 #
