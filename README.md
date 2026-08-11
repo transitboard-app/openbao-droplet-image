@@ -165,10 +165,11 @@ It is manual on purpose: this image is the boot medium for the machine holding e
 credential, so it is released when someone decides to, not when a branch moves. Tags are CalVer
 (`YYYY.MM.DD.N`), validated before the build runs, and the workflow refuses a tag that already exists.
 
-**While this repository is private, the release asset is not a usable import source.** DigitalOcean's
-importer performs an unauthenticated `GET` and no token handshake, so a private repository's assets are
-unreachable to it. Either make the repository public before publishing an image, or put the artifact
-behind a pre-signed Spaces URL and pass that to `mise run import`.
+**This repository is public, so a release asset is directly importable** — which is what makes the whole
+publishing path a one-liner. DigitalOcean's importer performs an unauthenticated `GET` and no token
+handshake, so this only holds while the repository stays public. If it is ever made private, release
+assets become unreachable to the importer and the artifact has to go behind a pre-signed Spaces URL
+instead. Nothing warns you: the import simply fails to fetch.
 
 ## Publishing
 
@@ -461,10 +462,33 @@ reboot with the store intact, and produced **zero AppArmor denials against the s
 `scp` of the TLS material, `bao status` with no environment set by hand, and `ip route replace` were all
 exercised on the same node. `documentation/` holds the audits that established this.
 
-### Still unsettled
+### On a real Droplet
 
-- **Never booted on a real Droplet.** DigitalOcean's own BIOS boot, metadata service and volume
-  attachment are imitated by the lab and the lab is not a substitute for any of them.
+**It has now run on DigitalOcean.** A `s-1vcpu-1gb` in `lon1`, built from the published
+`2026.08.11.6` release asset imported with `mise run import`, with a 1 GiB volume attached:
+
+| | |
+| --- | --- |
+| boot to SSH | **6.5s** first boot, **7.2s** rebooting with a live Raft store |
+| kernel done | 2.3s; root mounted 2.8s; last kernel message 5.3s |
+| `crng init done` | **0.04s** |
+| root filesystem | 1 GiB image grown to 24.6 GiB |
+| interfaces | `eth0` public, `eth1` VPC — the two-NIC arrangement is real |
+| Raft volume | found through sysfs as `/dev/sda` and mounted |
+| AppArmor denials | **0**, across install, init, unseal, traffic and a reboot |
+
+OpenBao was initialised, unsealed, served KV v2 reads and writes, took a policy and an AppRole, wrote
+audit records, survived a reboot with the store intact, and answered `GET /v1/sys/health` with **200**
+from the public internet. `bao status` worked over SSH with no environment set by hand and no
+`-tls-skip-verify`, against the private address DigitalOcean's own metadata service reported.
+
+**The boot is not slow — 6.5 seconds.** Every larger number in this repository's history was emulation:
+`mise run boot` on an Apple Silicon Mac is TCG, and CI was TCG too until `/dev/kvm` was made usable.
+Note especially `crng init done` at 0.04s: DigitalOcean presents no `virtio-rng` device, and entropy is
+still immediate, so the 13.9-second entropy stall that the QEMU boot test used to suffer is an artifact
+of the lab and not something a Droplet pays.
+
+### Still unsettled
 - **No credential has been minted against a real PostgreSQL instance.** The database secrets engine was
   shown to load in-process — it does not fork, so the profile's blanket exec denial is not a problem —
   and to reach `connect()`, but no database was stood up behind it.

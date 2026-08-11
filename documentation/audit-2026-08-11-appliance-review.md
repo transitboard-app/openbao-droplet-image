@@ -9,7 +9,9 @@ QEMU guest with a SCSI disk presenting as vendor `DO` model `Volume`, a metadata
 log rotated, and the node rebooted with the store intact — with **zero AppArmor denials against the
 server** throughout.
 
-The lab is not a Droplet. Nothing here has run on DigitalOcean.
+**It has since run on DigitalOcean.** See "On a real Droplet" at the end: a `s-1vcpu-1gb` in `lon1`
+built from the published release, boot to SSH in 6.5 seconds, zero AppArmor denials, store intact
+across a reboot.
 
 ## What changed, by weight
 
@@ -231,3 +233,40 @@ is a seal decision, not a performance one.
   stated in `setup.sh`; only one can be right if the presentation ever changes.
 - The image still carries `libcrypto` (4.8 MiB) and `libstdc++` (2.7 MiB), for sshd and
   `apparmor_parser`. Neither is removable without removing what links it.
+
+## On a real Droplet
+
+The standing gap in every previous audit, closed. A `s-1vcpu-1gb` in `lon1`, created from the
+`2026.08.11.6` release asset imported straight from GitHub — the repository is public, so DigitalOcean's
+unauthenticated fetcher can reach it — with a 1 GiB volume attached.
+
+| | Lab (TCG) | **Real Droplet** |
+| --- | --- | --- |
+| boot to SSH | 42s | **6.5s** |
+| reboot with a live store | 42s | **7.2s** |
+| kernel init done | 6.1s | 2.3s |
+| root mounted | 13.0s | 2.8s |
+| `crng init done` | 3.3s (with virtio-rng) | **0.04s** |
+
+Everything the lab claimed held: the Raft volume was found through sysfs as `/dev/sda`, the two-NIC
+arrangement is real (`eth0` public, `eth1` VPC), tiny-cloud grew the 1 GiB image to 24.6 GiB, the
+operator's key arrived from the metadata service, AppArmor came up enforcing, and OpenBao was
+initialised, unsealed, served KV v2, took a policy and an AppRole, wrote audit records and survived a
+reboot with the secret intact. **Zero AppArmor denials across all of it.** `bao status` worked over SSH
+with nothing set by hand and no `-tls-skip-verify`, and `GET /v1/sys/health` answered `200` from the
+public internet.
+
+Two findings worth keeping:
+
+**The boot was never slow.** 6.5 seconds. Every larger figure in this repository's history is emulation
+— `mise run boot` on an Apple Silicon Mac is TCG, and CI was TCG too until `/dev/kvm` was made usable.
+Tuning was still worth doing, but the thing being tuned was the measurement.
+
+**DigitalOcean presents no `virtio-rng`, and entropy is immediate anyway** — `crng init done` at 40
+milliseconds, with no `virtio_rng` module loaded and no `hw_random` device. So the 13.9-second entropy
+stall the QEMU boot test used to suffer is a property of the lab, not of a Droplet, and the fix for it
+belongs where it was made: in the test harness. Nothing about the image needs to change for entropy.
+
+One gap this exposed in the work above: the self-check printed its boot time to the serial console and
+nowhere else, so on a node that was up and reachable there was no way to ask what its boot had cost.
+It now goes to syslog as well.

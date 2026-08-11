@@ -219,5 +219,9 @@ signal path it depends on. Do not remove either without replacing what it does.
   instance, and Agent injection from a cluster has not been exercised.
 - The kernel command line carries `lockdown=integrity` and `module.sig_enforce=1`, both boot-tested
   alone. It still carries no `mitigations=`. That can prevent boot; add it on its own, with a boot test.
-- Nothing has run on a real Droplet since the appliance was rewritten. The lab imitates DigitalOcean's
-  volume presentation, metadata service and two-NIC arrangement, and is not a substitute for any of them.
+- **It has run on a real Droplet**, as of 2026-08-11: boot to SSH in 6.5s, the Raft volume found through
+  sysfs, OpenBao initialised, unsealed, served and rebooted with the store intact, and zero AppArmor
+  denials. What the lab still does not reproduce is the timing — it is TCG, an order of magnitude out —
+  so treat a boot measured there as useful only against another boot on the same host.
+- No credential has been minted against a real PostgreSQL instance, and Agent injection from a cluster
+  is still unexercised. Those are the remaining untested paths, not the platform.

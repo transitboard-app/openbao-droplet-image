@@ -29,7 +29,17 @@ start() {
 	fi
 	printf '%s\n' "$output" | sed 's/^/  /'
 	einfo "openbao-selfcheck: $verdict"
-	logger -t openbao-selfcheck "$verdict" 2>/dev/null || true
+
+	# The verdict AND how long the boot took, to syslog.
+	#
+	# The uptime line goes to the console with the rest of the check, which is right for an operator
+	# reading DigitalOcean's recovery console and useless afterwards: the console is not a file, so on a
+	# node that is up and reachable there was no way to ask what its boot cost. Found the hard way, on a
+	# real Droplet, with the number sitting in a console nobody could grep.
+	#
+	# In syslog it survives, which is what makes "did this boot get slower" answerable across reboots.
+	logger -t openbao-selfcheck "$verdict (boot reached this point at $(cut -d' ' -f1 /proc/uptime)s)" \
+		2>/dev/null || true
 
 	# ALWAYS zero, deliberately. A failing assertion is something an operator must see, not something that
 	# should stop a node coming up: refusing to finish the boot would take away sshd and the recovery
