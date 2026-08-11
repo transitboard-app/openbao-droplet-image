@@ -56,11 +56,13 @@ mkdir -p /mnt/img
 mount -o ro "$loop" /mnt/img
 R=/mnt/img
 
-# The package record, copied out while the image happens to be mounted. It is the only description of
-# what is installed once apk has been removed from the image, so it belongs beside the artifact rather
-# than only inside it -- the release notes publish it, and an operator can read it without mounting
-# anything.
+# The package record and the build manifest, copied out while the image happens to be mounted. Between
+# them they are the whole description of what this artifact is -- what is installed, and what built it --
+# and once apk is removed from the image there is nothing inside that can be asked. They belong beside
+# the artifact rather than only within it: the release notes publish both, so somebody deciding whether
+# to boot this image can read them without downloading and mounting it first.
 cp "$R/etc/openbao-appliance-packages" "$(dirname "$IMAGE")/packages.txt" 2>/dev/null || true
+cp "$R/etc/openbao-appliance-release" "$(dirname "$IMAGE")/release.txt" 2>/dev/null || true
 
 echo "==> boot"
 # The check this whole image most depends on. AppArmor is compiled into linux-virt but left out of
@@ -136,7 +138,15 @@ check "listener reads the volume" "grep -q '/var/lib/openbao/tls/server.crt' $R/
 # over a private address can never complete it, so the failure is a retry loop rather than a refusal.
 check "listener sets tls_cert_file" "grep -qE '^[[:space:]]*tls_cert_file[[:space:]]*=' $R/etc/openbao/config.d/10-listener.hcl"
 check "no acme shipped"           "! grep -rqE '^[[:space:]]*tls_acme_' $R/etc/openbao/config.d/"
-check "service gates on the volume" "grep -q '/var/lib/openbao/tls/server.crt' $R/etc/init.d/openbao"
+# The gate reads the configuration rather than a path compiled into the service, which is what lets a
+# node use ACME, tls_disable or a certificate somewhere else without the service refusing to start over
+# files its operator deliberately did not create. Asserted as the absence of the old hard-coded test as
+# well as the presence of the new lookup: leaving both in place would gate on the shipped path anyway.
+check "gate reads the config"     "grep -q 'config_values tls_cert_file' $R/etc/init.d/openbao"
+check "gate is not hard-coded"    "! grep -qE '^[[:space:]]*if \[ ! -f /var/lib/openbao/tls/server.crt' $R/etc/init.d/openbao"
+# The gate has to run after user_data has been turned into a fragment, or a listener supplied that way
+# is invisible to it. Ordering inside a shell function is not otherwise checkable offline.
+check "user_data read before gate" "[ \"\$(grep -n 'Loaded user_data as a configuration fragment' $R/etc/init.d/openbao | cut -d: -f1)\" -lt \"\$(grep -n 'names TLS material that is not there' $R/etc/init.d/openbao | cut -d: -f1)\" ]"
 # root:openbao 0750, not 65532:65532 0700, and this is now the mountpoint rather than a directory under
 # /etc. Owned by the uid OpenBao runs as, it could not be traversed by a confined root -- the AppArmor
 # profile attaches to /usr/sbin/bao and grants no capability -- which broke every operator command on the
@@ -195,7 +205,11 @@ check "no package manager"        "! test -e $R/sbin/apk"
 # build failure, not a cosmetic gap.
 check "package record populated"  "[ \"$packages\" -gt 50 ]"
 check "no setuid binaries"        "[ \"$setuid\" -eq 0 ]"
-check "no interpreters"           "! ls $R/usr/bin/python3* $R/usr/bin/perl 2>/dev/null | grep -q ."
+check "no interpreters"           "! ls $R/usr/bin/python3* $R/usr/bin/perl $R/usr/bin/ruby $R/usr/bin/lua* 2>/dev/null | grep -q ."
+# The scripts an interpreter would run, checked separately because the check above looks for the
+# interpreter. syslinux shipped /usr/bin/isohybrid.pl, which was inert only because no perl was
+# installed -- an argument that stops holding the moment anything pulls one in.
+check "no interpreter scripts"    "! ls $R/usr/bin/*.pl $R/usr/bin/*.py $R/usr/sbin/*.pl $R/usr/sbin/*.py 2>/dev/null | grep -q ."
 # Python's dependency closure, orphaned when its files were removed. libstdc++ is deliberately absent
 # from this check: apparmor_parser links it.
 check "no orphaned sqlite"        "! ls $R/usr/lib/libsqlite3.so* 2>/dev/null | grep -q ."
@@ -207,8 +221,46 @@ check "no capability tools"       "! ls $R/usr/sbin/setcap $R/usr/sbin/capsh $R/
 # Symbols on a host holding unsealed key material help an attacker more than an operator.
 check "bao is stripped"           "! readelf -S $R/usr/sbin/bao 2>/dev/null | grep -q '\.symtab'"
 check "binary provenance kept"    "test -s $R/etc/openbao-binary-provenance"
+# The provenance file records the checksum of the binary that was staged. This is the only place it is
+# compared against the binary that actually SHIPPED -- without it the file is a claim written next to
+# the thing it describes rather than a fact about it, which is the difference between provenance and a
+# label. It also catches a stage directory reused across builds.
+check "provenance matches bao"    "grep -q \"stripped \$(sha256sum $R/usr/sbin/bao | cut -d' ' -f1)\" $R/etc/openbao-binary-provenance"
+# What built this image. For an artifact other people download and boot, "which commit of the recipe is
+# this" has no answer outside the image itself.
+check "release manifest kept"     "test -s $R/etc/openbao-appliance-release"
+check "manifest names a commit"   "grep -q '^source-commit ' $R/etc/openbao-appliance-release"
+check "manifest names the branch" "grep -q '^alpine-branch ' $R/etc/openbao-appliance-release"
 check "no kernel symbol map"      "! ls $R/boot/System.map-* 2>/dev/null | grep -q ."
 check "no syslinux payload"       "! test -d $R/usr/share/syslinux"
+# The bootloader INSTALLER, distinct from the payload above. extlinux is already written to this disk,
+# so what is left is a tool for writing a bootloader onto one, plus a FAT editor and an ISO rewriter.
+check "no bootloader installer"   "! ls $R/sbin/extlinux $R/usr/bin/syslinux $R/usr/bin/isohybrid* $R/usr/bin/mtools 2>/dev/null | grep -q ."
+# mkinitfs exists to build the initramfs and has built it. Nothing on a node with no package manager
+# updates a kernel, so nothing regenerates one. It is also what put a disk-encryption and device-mapper
+# stack on an appliance that mounts one plain ext4 filesystem: nlplug-findfs links libcryptsetup.
+check "no initramfs toolchain"    "! ls $R/sbin/mkinitfs $R/sbin/nlplug-findfs 2>/dev/null | grep -q ."
+check "no cryptsetup stack"       "! ls $R/usr/lib/libcryptsetup.so* $R/usr/lib/libdevmapper.so* 2>/dev/null | grep -q ."
+# A raw ext2/3/4 editor reads and writes the Raft volume's blocks around every permission on them, and
+# around the AppArmor profile that stops OpenBao itself doing it. resize2fs is in the same subpackage
+# and is genuinely needed, which is why this is a check on the tools rather than on the package.
+check "no raw filesystem editor"  "! ls $R/usr/sbin/debugfs $R/usr/sbin/e2image $R/usr/sbin/badblocks 2>/dev/null | grep -q ."
+check "resize2fs kept"            "test -x $R/usr/sbin/resize2fs"
+# Every SSH session this node takes part in is inbound: the tunnels are `ssh -L` from an operator's
+# machine. The client suite has no caller here and is 2.2 MiB of it.
+check "no ssh client"             "! ls $R/usr/bin/ssh $R/usr/bin/scp $R/usr/bin/sftp $R/usr/bin/ssh-agent $R/usr/bin/ssh-keyscan 2>/dev/null | grep -q ."
+# ...but scp INTO the node is the documented way TLS material arrives, and OpenSSH 9 runs it over SFTP.
+check "sftp subsystem present"    "test -x $R/usr/lib/ssh/sftp-server"
+check "ssh-keygen kept"           "test -x $R/usr/bin/ssh-keygen"
+# tc is a traffic-shaping language and libxtables is linked only by it. `ip` comes from
+# iproute2-minimal, so `ip route replace` is unaffected by their absence.
+check "no traffic control"        "! ls $R/sbin/tc $R/usr/lib/libxtables.so* 2>/dev/null | grep -q ."
+check "ip route tool kept"        "test -x $R/sbin/ip"
+# Python's dependency closure. These outlived the interpreter because the removal listed two libraries
+# and stopped; nothing in the image links any of them.
+check "no orphaned python libs"   "! ls $R/usr/lib/libffi.so* $R/usr/lib/libgdbm* $R/usr/lib/libpanelw.so* $R/usr/lib/libreadline.so* $R/usr/lib/libexpat.so* 2>/dev/null | grep -q ."
+# Removing /sbin/apk and leaving the library that installs packages behind is half the job.
+check "no apk library"            "! ls $R/usr/lib/libapk.so* 2>/dev/null | grep -q ."
 check "chronyd is client-only"    "grep -q '^port 0' $R/etc/chrony/conf.d/10-appliance.conf"
 # The check that would have caught an unreachable node. Empty CLOUD_USER makes tiny-cloud skip installing
 # the SSH keys DigitalOcean injects, leaving a Droplet that boots, runs sshd, and admits nobody.
@@ -283,6 +335,59 @@ check "no nvme target"            "! test -d $R/lib/modules/*/kernel/drivers/nvm
 # 1.4 MiB of hypervisor that loaded itself into the secret store host, observed in lsmod on the running
 # appliance.
 check "no kvm"                    "! test -d $R/lib/modules/*/kernel/arch/x86/kvm"
+# A Droplet's NIC is virtio. What the prune removes is drivers for hardware that cannot be attached,
+# plus the encapsulation drivers -- ppp, slip, wireguard, ovpn, vxlan, macsec, tun -- each of which the
+# kernel autoloads the moment something asks for that link type, and none of which has a caller here.
+#
+# **Asserted against the dependency closure, not against the name.** The first version of this check
+# demanded that drivers/net contain nothing but virtio_net, which is wrong in the specific way that
+# matters: virtio_net loads with net_failover, and an image that satisfies the naive check is one whose
+# network does not come up. Both this and the prune it verifies read modules.dep, so neither can be
+# right about a module while being wrong about what it needs.
+kver="$(ls "$R/lib/modules" | head -1)"
+netdep="$(grep -m1 '/virtio_net\.ko' "$R/lib/modules/$kver/modules.dep" 2>/dev/null || true)"
+allowed=" $(printf '%s' "$netdep" | tr ':' ' ' | tr ' ' '\n' | sed 's|.*/||' | tr '\n' ' ') "
+unexpected="$(find "$R/lib/modules/$kver/kernel/drivers/net" -type f -name '*.ko*' -printf '%f\n' 2>/dev/null |
+	while read -r m; do case "$allowed" in *" $m "*) ;; *) echo "$m" ;; esac; done)"
+check "only virtio networking"    "[ -z \"$unexpected\" ]"
+[ -z "$unexpected" ] || echo "$unexpected" | sed 's/^/    unexpected: /'
+# The other half of the same question, and the one the boot answers if this does not: everything
+# virtio_net loads with has to still be on disk. A missing dependency is invisible offline otherwise --
+# the module file is present, so every check that looks for it passes, and the node boots with no
+# network, no metadata, no SSH and no OpenBao.
+missing_dep=""
+for path in $(printf '%s' "$netdep" | tr ':' ' '); do
+	[ -f "$R/lib/modules/$kver/$path" ] || missing_dep="$missing_dep $path"
+done
+check "virtio_net deps present"   "[ -z \"$missing_dep\" ]"
+[ -z "$missing_dep" ] || echo "    missing:$missing_dep"
+# SCSI generic passes arbitrary SCSI commands straight to a device, which on this node means straight to
+# the disk holding the Raft store. sr_mod is a CD-ROM driver on a machine with no optical drive.
+check "no scsi passthrough"       "! ls $R/lib/modules/*/kernel/drivers/scsi/sg.ko* $R/lib/modules/*/kernel/drivers/scsi/sr_mod.ko* 2>/dev/null | grep -q ."
+check "no iscsi or fc transports" "! ls -d $R/lib/modules/*/kernel/drivers/scsi/*iscsi* $R/lib/modules/*/kernel/drivers/scsi/*transport* 2>/dev/null | grep -q ."
+check "virtio_scsi kept for raft" "ls $R/lib/modules/*/kernel/drivers/scsi/virtio_scsi.ko* >/dev/null 2>&1"
+check "sd_mod kept for raft"      "ls $R/lib/modules/*/kernel/drivers/scsi/sd_mod.ko* >/dev/null 2>&1"
+
+echo "==> initramfs"
+# **The initramfs is generated when the kernel package is installed, which is before setup.sh runs.**
+# So for as long as this image has existed, every module the build carefully removed from /lib/modules
+# was still sitting in /boot/initramfs-virt -- 1.4 MiB of GPU drivers, 724 KiB of USB, RAID, HID and the
+# whole filesystem tree -- and the claim "a module that is not on disk cannot be loaded" was true of the
+# root filesystem and false of the boot medium beside it. setup.sh now regenerates it after pruning.
+#
+# Checked with cpio against the real archive rather than by grepping the compressed bytes, because a
+# path that appears inside some other file would answer the wrong question.
+initfs_list="$(gzip -dc "$R/boot/initramfs-virt" 2>/dev/null | cpio -it 2>/dev/null)"
+check "initramfs is readable"     "[ -n \"\$(printf '%s' \"$initfs_list\" | head -c1)\" ]"
+check "initramfs mounts root"     "printf '%s' \"$initfs_list\" | grep -q 'virtio_blk'"
+check "initramfs has ext4"        "printf '%s' \"$initfs_list\" | grep -q 'fs/ext4'"
+check "initramfs has virtio_scsi" "printf '%s' \"$initfs_list\" | grep -q 'virtio_scsi'"
+check "initramfs has no gpu"      "! printf '%s' \"$initfs_list\" | grep -q 'drivers/gpu'"
+check "initramfs has no usb"      "! printf '%s' \"$initfs_list\" | grep -q 'drivers/usb'"
+check "initramfs has no raid"     "! printf '%s' \"$initfs_list\" | grep -q 'drivers/md'"
+check "initramfs has no hid"      "! printf '%s' \"$initfs_list\" | grep -q 'drivers/hid'"
+check "initramfs fs is ext4 only" "! printf '%s' \"$initfs_list\" | grep -qE 'fs/(btrfs|xfs|squashfs|f2fs|ntfs)'"
+echo "  initramfs: $(( $(stat -c %s "$R/boot/initramfs-virt") / 1024 )) KiB, $(printf '%s' "$initfs_list" | grep -c '\.ko' || true) modules"
 
 echo "==> services"
 # `test -L`, not `ls`. Runlevel entries are symlinks to absolute paths (/etc/init.d/openbao), so they
@@ -315,8 +420,49 @@ check "openbao reload defined"    "grep -q 'extra_started_commands=\"reload\"' $
 echo "==> ssh"
 # Turning this off is the most plausible well-intentioned change that would break operations entirely,
 # so it is asserted rather than left to review.
-check "tcp forwarding allowed"    "grep -q '^AllowTcpForwarding yes' $R/etc/ssh/sshd_config.d/10-appliance.conf"
-check "password auth disabled"    "grep -q '^PasswordAuthentication no' $R/etc/ssh/sshd_config.d/10-appliance.conf"
+S=$R/etc/ssh/sshd_config.d/10-appliance.conf
+check "tcp forwarding allowed"    "grep -q '^AllowTcpForwarding yes' $S"
+check "password auth disabled"    "grep -q '^PasswordAuthentication no' $S"
+# TCP forwarding is needed and unix-socket forwarding is not; they are separate options and turning on
+# the first does not turn on the second.
+check "no unix socket forwarding" "grep -q '^AllowStreamLocalForwarding no' $S"
+# The subsystem has to be named because the image installs openssh-sftp-server as its own package
+# rather than taking the meta-package, and scp is how TLS material reaches the node.
+check "sftp subsystem configured" "grep -q '^Subsystem sftp /usr/lib/ssh/sftp-server' $S"
+# Which key authenticated, not merely that root did. On a node whose only account is shared, the key
+# fingerprint is the only attribution there is.
+check "verbose auth logging"      "grep -q '^LogLevel VERBOSE' $S"
+check "startup concurrency bound" "grep -q '^MaxStartups ' $S"
+
+echo "==> host hardening"
+# Twenty-eight sysctls, of which these are the ones whose absence is silent. Checked in the file rather
+# than at runtime -- openbao-selfcheck does the runtime half on a booted node.
+Y=$R/etc/sysctl.d/99-openbao.conf
+# The largest piece of kernel attack surface an unprivileged process can reach, and nothing here uses
+# one: there is no container runtime, which is the whole reason this image exists.
+check "user namespaces refused"   "grep -q '^user.max_user_namespaces=0' $Y"
+check "core dumps discarded"      "grep -q '^kernel.core_pattern=|/bin/false' $Y"
+check "ptrace fully restricted"   "grep -q '^kernel.yama.ptrace_scope=3' $Y"
+check "symlink protection on"     "grep -q '^fs.protected_symlinks=1' $Y"
+check "hardlink protection on"    "grep -q '^fs.protected_hardlinks=1' $Y"
+# Loose rather than strict, deliberately: D20 routes pod traffic here whose source address belongs to
+# none of this node's subnets, and strict mode drops exactly that, silently.
+check "rp_filter is loose"        "grep -q '^net.ipv4.conf.all.rp_filter=2' $Y"
+
+echo "==> operator experience"
+# The image's own rule is that anything making an operator reach for -tls-skip-verify is a bug in the
+# image. Nothing set BAO_CACERT, so the first command run on any node failed certificate verification
+# and that flag was the documented way out of it.
+check "cli env installed"         "test -f $R/etc/profile.d/openbao.sh"
+check "cli env sets the ca"       "grep -q 'BAO_CACERT' $R/etc/profile.d/openbao.sh"
+check "cli env reads the config"  "grep -q 'tls_client_ca_file' $R/etc/profile.d/openbao.sh"
+# Never a hard-coded path: a node whose operator replaced the listener fragment or uses ACME must not
+# have a stale CA forced on its CLI.
+check "cli env is not hard-coded" "! grep -qE 'BAO_CACERT=[\"]?/' $R/etc/profile.d/openbao.sh"
+# One Droplet with no attached volume is a legitimate arrangement, and refusing it outright is a
+# lock-in rather than a safeguard. It has to be said explicitly, so it cannot be reached by accident.
+check "volume opt-out supported"  "grep -q 'RAFT_DEVICE:-}\" = \"none\"' $R/etc/init.d/openbao-volume"
+check "volume opt-out documented" "grep -q 'RAFT_DEVICE=\"none\"' $R/etc/conf.d/openbao-volume"
 
 echo
 if [ "$fail" -ne 0 ]; then
