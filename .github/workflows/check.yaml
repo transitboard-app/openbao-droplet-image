@@ -1,0 +1,84 @@
+name: Check
+
+# Everything the release workflow does except publish, run on every change.
+#
+# This exists because nothing ran automatically before it. `lint`, `verify` and `boot` were tasks a
+# person remembered to type, and the release workflow was the only thing that ran them -- at the moment
+# an image was being published, which is the worst time to discover that a module prune broke the boot.
+# The tasks were already written; only the trigger was missing.
+#
+# It is also what makes the repository's central claim checkable by a stranger. This image is offered
+# for other people to boot, and "every property is asserted by something that fails loudly" is worth
+# rather less if the things that fail loudly only run on a maintainer's laptop.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Same host as the release build, deliberately. A check that runs somewhere else is not checking
+    # the thing that gets published.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+
+      # The lockfile is the record of which bytes an image was built from, so it is only worth having
+      # if it is in step with the config beside it. `mise lock` rewrites it from the current versions;
+      # if that produces a diff, the committed lockfile was stale and every claim made about it was
+      # about the wrong artifact.
+      - name: Check the lockfile is current
+        run: |
+          mise lock
+          if ! git diff --exit-code -- mise.linux-x64.lock; then
+            echo "::error::mise.linux-x64.lock is out of date. Run 'mise lock' and commit the result."
+            exit 1
+          fi
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Refresh the apt index
+        run: sudo apt-get update
+
+      - name: Install system packages
+        run: mise bootstrap packages apply --yes
+
+      - name: Load nbd
+        run: sudo modprobe nbd max_part=8
+
+      - name: Build
+        run: mise run build
+
+      - name: Verify
+        run: mise run verify
+
+      # /dev/kvm is not reliably present on GitHub-hosted runners, so this runs under TCG and takes a
+      # few minutes. It is the only thing that can catch a change which breaks the boot rather than the
+      # contents -- a pruned module the initramfs needed, or a deleted binary other names point at.
+      - name: Boot test
+        run: mise run boot --seconds 300
+
+      # The boot log, which is the only account of what happened if the step above fails.
+      - name: Upload the boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: .build/boot/boot.log
+          if-no-files-found: ignore

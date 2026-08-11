@@ -7,3 +7,32 @@
 #
 # mise 2026.8.3 defaults this off; it becomes the default in 2027.6.0.
 auto_env = true
+
+# Record every tool's resolved version and checksum in a lockfile, and install from it.
+#
+# This is the supply-chain control for the two things the build downloads. `alpine-make-vm-image`
+# already carried a `checksum` in its [tools] entry because the http backend requires one; the OpenBao
+# binary did not, so the whole payload of a secret store arrived over the network with nothing checking
+# it. The build asserts a hand-written sha256 against the staged bytes, which caught a swapped file but
+# only after mise had already downloaded, unpacked and cached it -- and only because somebody kept that
+# constant up to date by hand.
+#
+# With this on, mise resolves every tool through mise.linux-x64.lock -- the version, the download URL
+# and the checksum -- and installs what the lockfile says rather than what the registry offers today.
+# The lockfile is committed: it is the record of exactly which bytes a given image was built from,
+# which is the question an audit of a published image actually asks. `shellcheck = "latest"` is pinned
+# by it too, so "latest" means "whatever the lockfile says" rather than "whatever exists today".
+#
+# The setting is `locked`, not `lockfile`. mise 2026.8.3 accepts unknown keys in this file in silence,
+# so the wrong name reads exactly like a working one -- `mise settings get locked` is how to tell.
+# Regenerate the lockfile with `mise lock` after changing a version in mise.linux-x64.toml.
+locked = true
+
+# Check the build-provenance attestation of a tool that publishes one, not merely its checksum.
+#
+# A checksum says the bytes did not change between the lockfile being written and now. An attestation
+# says which repository, workflow and commit produced them, which is the question worth asking about a
+# binary that becomes the entire payload of a secret store. `slsa` and `github_attestations` are on by
+# mise's own default; this is the half that is not, and it makes verification failure fatal rather than
+# advisory.
+locked_verify_provenance = true

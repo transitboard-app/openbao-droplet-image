@@ -18,9 +18,12 @@ on:
         type: boolean
         default: false
 
-# Only what creating a release needs.
+# Only what creating a release and attesting it needs. `id-token` is the OIDC token the attestation is
+# signed with and `attestations` is the write scope for recording it; neither grants anything else.
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -93,6 +96,21 @@ jobs:
       - name: Compress
         run: mise run compress
 
+      # What a downloader cannot otherwise establish about a published qcow2: which repository, which
+      # workflow and which commit produced it. The image inside carries /etc/openbao-appliance-release
+      # saying so, but that is the artifact describing itself -- an attestation is signed by GitHub's
+      # OIDC identity and verified without trusting the artifact at all:
+      #
+      #   gh attestation verify openbao-appliance.qcow2.bz2 --repo <owner>/<repo>
+      #
+      # This matters more here than for most images. The thing being published boots the machine that
+      # holds every production credential, and it is advertised for other people to boot too, so
+      # "where did this file come from" has to be answerable by someone who has only the file.
+      - name: Attest the artifact's provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/openbao-appliance.qcow2.bz2
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -112,9 +130,25 @@ jobs:
             echo "size    $(du -h "$artifact" | cut -f1)"
             echo '```'
             echo
+            echo "Verify where this came from before booting it — the attestation is signed by"
+            echo "GitHub and needs no trust in the file itself:"
+            echo
+            echo '```bash'
+            echo "gh attestation verify openbao-appliance.qcow2.bz2 --repo ${{ github.repository }}"
+            echo '```'
+            echo
             echo "Import it with \`mise run import <url>\` once the asset is reachable by an"
             echo "unauthenticated GET. **A private repository's release assets are not**, and"
             echo "DigitalOcean's importer performs no token handshake."
+            echo
+            # What built the image, read out of the image itself by `mise run verify`. The same file
+            # ships inside as /etc/openbao-appliance-release.
+            echo "<details><summary>Build manifest</summary>"
+            echo
+            echo '```'
+            cat out/release.txt 2>/dev/null || echo "(not recorded)"
+            echo '```'
+            echo "</details>"
             echo
             echo "<details><summary>Installed packages</summary>"
             echo

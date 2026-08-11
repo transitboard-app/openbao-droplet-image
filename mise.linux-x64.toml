@@ -71,14 +71,21 @@ image_name = "openbao-appliance"
 # The expected sha256 of the OpenBao binary, and the `stage:payload` task compares the staged bytes
 # against it before anything else touches them.
 #
-# That comparison is new, and its absence was a real gap rather than a tidiness one. The `[tools]` entry
-# above carries no `checksum` and there is no `mise.lock`, so nothing verified this download -- while the
-# `http:alpine-make-vm-image` entry beside it does carry one, which made the gap easy to miss. This value
-# was interpolated into the provenance file as `upstream <sha>` and compared to nothing, so a tampered
-# binary would have been recorded with the checksum it failed to match. This is the whole payload of a
-# secret store, fetched over the network on every build.
+# **This is now the second control rather than the only one, and it checks a different artifact.**
+# `.miserc.toml` sets `locked = true`, so mise resolves this tool through mise.linux-x64.lock and
+# verifies the download against the checksum recorded there. That is the better mechanism and it is
+# where the trust now lives.
 #
-# Enabling mise's lockfile is the better long-term answer and would make this redundant.
+# The two are not the same check. The lockfile records the sha256 of the release ARCHIVE as upstream
+# published it -- `openbao_2.6.1_linux_amd64.tar.gz`, ca8d836e... -- verified once, when mise downloads
+# into its cache. This records the sha256 of the BINARY inside it, verified against the bytes that are
+# about to be copied into the image, after they have been through that cache and off PATH. Between
+# those two points sit an extraction and a writable directory on the build host, and what passes
+# through them is the entire payload of a secret store.
+#
+# Keep it in step with the lockfile: `mise run stage` fails loudly if they disagree, which is the
+# intended way to notice that an upgrade changed one and not the other. `mise lock` refreshes the
+# lockfile; this constant is updated by hand from the failure message.
 bao_sha256 = "736b8ecf354fda6b2af62e4ae064f12fe6c52d7db8425b9c6de22f286a5485ec"
 
 # Working directories, declared here rather than per task because the build: and boot: subtasks below
@@ -114,6 +121,11 @@ IMAGE = "{{ config_root }}/out/{{ vars.image_name }}.qcow2"
 "apt:bzip2" = "latest"
 "apt:binutils" = "latest"
 "apt:wget" = "latest"
+# cpio, for reading the initramfs in scripts/verify-image. The image's module pruning is only half done
+# unless the initramfs is pruned too, and checking that means listing the archive rather than grepping
+# its compressed bytes. Not on a minimal Ubuntu; busybox provides it inside the chroot, which is why
+# setup.sh needs no equivalent.
+"apt:cpio" = "latest"
 "apt:qemu-utils" = "latest"
 "apt:qemu-system-x86" = "latest"
 "apt:rsync" = "latest"
@@ -123,6 +135,7 @@ IMAGE = "{{ config_root }}/out/{{ vars.image_name }}.qcow2"
 "apk:bzip2" = "latest"
 "apk:binutils" = "latest"
 "apk:wget" = "latest"
+"apk:cpio" = "latest"
 "apk:qemu-img" = "latest"
 "apk:qemu-system-x86_64" = "latest"
 "apk:rsync" = "latest"
@@ -138,7 +151,7 @@ IMAGE = "{{ config_root }}/out/{{ vars.image_name }}.qcow2"
 # inline scripts and `run` arrays -- measured, not assumed.
 [tasks.deps]
 description = "Check the host can do what the build needs"
-vars = { required = "qemu-img qemu-nbd rsync sfdisk mkfs.ext4 losetup wget" }
+vars = { required = "qemu-img qemu-nbd rsync sfdisk mkfs.ext4 losetup wget cpio" }
 run = """
 missing=""
 for tool in {{ vars.required }}; do
@@ -206,12 +219,55 @@ run = [
 	"""echo "staged bao: $(bao version | head -1)" """,
 ]
 
+# What a published image cannot be asked afterwards, so it is written into it.
+#
+# /etc/openbao-appliance-packages says what is installed and /etc/openbao-binary-provenance says which
+# OpenBao binary it is. Neither says which SOURCE built the image -- and for an artifact other people
+# download and boot, "which commit of the recipe is this" is the question an audit actually asks. A
+# qcow2 has no metadata to carry it, so the answer has to be a file inside.
+#
+# The git values degrade rather than fail. A release is built from a checkout and gets a commit; a build
+# from an exported copy honestly records that it had none, which is more useful than a task that stops.
+# `dirty` is recorded for the same reason: an image built from uncommitted edits is not the commit it
+# names, and that is exactly the thing a reader needs told.
+[tasks."stage:manifest"]
+description = "Record what this build was made from"
+run = """
+cd {{ config_root }}
+commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ "$commit" != unknown ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+	commit="$commit (dirty: built from uncommitted changes)"
+fi
+
+cat > {{ vars.stage_dir }}/release <<MANIFEST
+# What this image was built from. See /etc/openbao-appliance-packages for what is installed and
+# /etc/openbao-binary-provenance for the OpenBao binary's checksums.
+image           {{ vars.image_name }}
+built           $(date -u +%Y-%m-%dT%H:%M:%SZ)
+source-commit   $commit
+alpine-branch   {{ vars.alpine_branch }}
+alpine-mirror   {{ vars.alpine_mirror }}
+openbao         $(bao version | head -1)
+builder         mise $(mise --version | head -1)
+MANIFEST
+cat {{ vars.stage_dir }}/release
+"""
+
+# **No `sources`/`outputs`, deliberately, and it used to have them.**
+#
+# Skipping this when image/ has not changed is wrong now that stage:manifest records a build date and a
+# source commit: a skipped stage leaves the previous run's manifest in place, and the image ships a
+# traceability file describing a different build. A file whose whole job is to say what this artifact
+# came from is the last one that should be allowed to go stale.
+#
+# It is also the exact shape of a defect this repository has already shipped once. `stage` declared
+# sources=["image/**/*"], `stage:payload` was the only thing that wiped the stage directory, and an
+# interrupted build therefore left a marker behind that the next build reused. Re-staging costs a few
+# seconds of a 30-second build, and buys back a whole class of stale-input bug.
 [tasks.stage]
 description = "Assemble everything the build feeds into the chroot"
 depends = ["deps"]
-sources = ["image/**/*"]
-outputs = ["{{ vars.stage_dir }}/setup.sh"]
-run = [{ task = "stage:overlay" }, { task = "stage:payload" }]
+run = [{ task = "stage:overlay" }, { task = "stage:payload" }, { task = "stage:manifest" }]
 
 # --partition is REQUIRED, not a preference: alpine-make-vm-image otherwise writes the filesystem
 #   straight onto the disk with no partition table, which boots fine under QEMU and is rejected at
@@ -402,7 +458,11 @@ description = "Assert the captured boot log shows a working system"
 run = [
 	"""grep -iE "AppArmor|expand_root|TLS material|Starting|\\[ !! \\]" {{ vars.boot_work }}/boot.log | head -30 || true""",
 	"""grep -q "Loading AppArmor profiles" {{ vars.boot_work }}/boot.log || { echo "FATAL: AppArmor profiles never loaded; the boot did not reach OpenRC" >&2; exit 1; }""",
-	"""grep -q "No TLS material" {{ vars.boot_work }}/boot.log || { echo "FATAL: the openbao service never ran its TLS gate" >&2; exit 1; }""",
+	# The gate now reports the certificate the CONFIGURATION names rather than a path baked into the
+	# service, so this matches the sentence rather than the old fixed message. What is being asserted is
+	# unchanged: OpenBao refused to start because the material is not there, which is the intended
+	# first-boot state and the one thing a lab with no certificate can prove about it.
+	"""grep -q "names TLS material that is not there" {{ vars.boot_work }}/boot.log || { echo "FATAL: the openbao service never ran its TLS gate" >&2; exit 1; }""",
 	# The regression check for the bug that shipped three times. Nothing provided `net`, so every service
 	# declaring `need net` -- tiny-cloud-main and cloud-ssh-keys both -- silently never ran, and the node
 	# booted, answered on port 22 and installed no keys. Now that boot:run serves metadata, this asserts
@@ -486,7 +546,7 @@ echo "  mise:      $(sha256sum "$(command -v bao)" | cut -d' ' -f1)"
 
 [tasks.lint]
 description = "Shellcheck the runtime scripts the image ships"
-run = "shellcheck --shell=sh --severity=warning scripts/verify-image scripts/fake-metadata image/setup.sh image/overlay/etc/init.d/* image/overlay/usr/local/sbin/*"
+run = "shellcheck --shell=sh --severity=warning scripts/verify-image scripts/fake-metadata image/setup.sh image/overlay/etc/init.d/* image/overlay/usr/local/sbin/* image/overlay/etc/profile.d/*.sh"
 
 [tasks.clean]
 description = "Remove build outputs and staging"
