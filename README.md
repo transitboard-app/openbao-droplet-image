@@ -99,8 +99,8 @@ running node. Each is removed and recorded in `/etc/openbao-appliance-packages`:
 There is no package manager, no shell for the `openbao` user, no interpreter, no setuid binary, no SSH
 client and no bootloader installer. `mise run verify` fails if any of those reappear.
 
-Size is dominated by OpenBao itself: `bao` is 136 MiB stripped, of a 201 MiB image. Of the remaining
-65 MiB, 12 MiB is the kernel and 5 MiB the initramfs. Choosing a smaller distribution moves a number that
+Size is dominated by OpenBao itself: `bao` is 136 MiB stripped, of 185 MiB of content. Of the
+remaining 49 MiB, 12 MiB is the kernel and 5 MiB the initramfs. Choosing a smaller distribution moves a number that
 was never the constraint — the reason to build this is the attack surface, not the megabytes.
 
 The kernel is cut the same way, and the two halves have to be cut together. `setup.sh` prunes
@@ -231,6 +231,41 @@ That asserts AppArmor is enforcing, OpenBao is confined, it holds no capabilitie
 recorded against the server. It is the difference between the image being configured correctly and the
 node being correct. It also runs at the end of every boot, so its verdict is on the serial console
 DigitalOcean's recovery console shows without anyone having to ask for it.
+
+### Knowing when it is ready
+
+**DigitalOcean has no readiness hook.** A Droplet is `active` in the API as soon as the hypervisor has
+started it; there is no callback, no health gate, and nothing analogous to an ASG lifecycle hook. The
+provider never learns that OpenBao is serving, and nothing in `/etc/init.d` can tell it — OpenRC reports
+a service `started` the moment `supervise-daemon` has spawned the process, which here is true while the
+node is still sealed and serving nothing.
+
+The readiness signal is OpenBao's own, and it is an HTTP endpoint:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' --cacert ca.crt https://<node>:8200/v1/sys/health
+```
+
+| Code | Means |
+| --- | --- |
+| 200 | initialized, unsealed, active — **ready** |
+| 429 | unsealed but standby |
+| 501 | not initialized |
+| 503 | sealed |
+
+Three ways to consume it, depending on what needs to know:
+
+- **A DigitalOcean Load Balancer** in front of the Droplets is the closest thing to the provider knowing:
+  its health check polls that path and it routes only to healthy nodes. Note it must trust the
+  certificate, so a private CA means using a TCP check or a publicly-trusted certificate.
+- **Terraform/OpenTofu** gating dependent resources on a poll of the same endpoint.
+- **A human**, from `openbao-selfcheck` — which now prints `READY` or the reason it is not, at the end of
+  every boot, onto the serial console DigitalOcean's recovery console shows. That is the one place you
+  can see "sealed, waiting for you" without being able to log in first.
+
+**With the default Shamir seal a node can never become ready on its own**, because unsealing needs a
+human with key shares — so if what you want is a Droplet that boots straight into service, the lever is
+auto-unseal (see [Sealing](#sealing)), not anything about boot speed.
 
 ### Configuring a node
 
@@ -390,8 +425,13 @@ reporting it as a fault. Root expansion is tiny-cloud's, measured: a 1 GiB image
 with a 5118 MiB root filesystem.
 
 93 packages, 0 setuid/setgid binaries, no interpreter, no package manager, no SSH client, no dangling
-symlinks, 293 kernel modules in 6.4 MiB and a 5.4 MiB initramfs holding 20. 201 MiB of qcow2,
-**71 MiB compressed**. 166 offline checks.
+symlinks, 293 kernel modules in 6.4 MiB and a 5.4 MiB initramfs holding 20. **185 MiB of content**,
+**82 MiB compressed**. 166 offline checks.
+
+The qcow2 file is larger than the content and by a host-dependent amount: 219 MiB built on
+`ubuntu-24.04` with qemu-img 8.2, 201 MiB built with qemu-img 10.2, from byte-identical filesystems —
+`build:compact` drops zero clusters and newer qemu-img finds more of them. Quote the content size or the
+compressed one; the qcow2 size is a property of the builder.
 
 **OpenBao has been run through this image.** Against a faked DigitalOcean environment — a SCSI disk
 presenting as vendor `DO` model `Volume`, a metadata service on `169.254.169.254`, and two interfaces —

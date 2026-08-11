@@ -192,6 +192,52 @@ else
 	echo "  ....  no seal declared; this node unseals with Shamir shares"
 fi
 
+echo "Readiness"
+# **A running OpenBao is not a ready one, and nothing else on this node says so.**
+#
+# OpenRC reports this service `started` the moment supervise-daemon has spawned the process, which is
+# true and useless: with the image's default Shamir seal the server comes up sealed after every restart
+# and serves nothing until somebody unseals it. `rc-service openbao status` says "started" throughout.
+# DigitalOcean has no readiness hook to tell either -- a Droplet is active as soon as the hypervisor
+# says so -- so the only signal is OpenBao's own, and this is where it gets printed.
+#
+# Printed at the end of every boot, which means it lands on the serial console DigitalOcean's recovery
+# console shows. That is the one place an operator can see "sealed, waiting for you" without first
+# being able to log in.
+#
+# Asked over the API rather than inferred, because sealed, uninitialized and standby are different
+# states and only the server knows which it is in. The address and CA come from the same file the
+# operator's shell uses, so there is one definition of where this node's API is.
+if [ -n "$pid" ]; then
+	# shellcheck source=/dev/null
+	[ -f /etc/profile.d/openbao.sh ] && . /etc/profile.d/openbao.sh
+	status="$(BAO_CLIENT_TIMEOUT=5 bao status 2>&1 || true)"
+	sealed="$(printf '%s' "$status" | awk '/^Sealed/ {print $2}')"
+	initialized="$(printf '%s' "$status" | awk '/^Initialized/ {print $2}')"
+	case "$initialized:$sealed" in
+	false:*)
+		echo "  ....  NOT READY -- initialized=false. Run \`bao operator init\` once, from anywhere"
+		echo "        that can reach this node's API."
+		;;
+	true:true)
+		echo "  ....  NOT READY -- sealed. Unseal it, or configure auto-unseal so a reboot does not"
+		echo "        need a human; README.md has the trade."
+		;;
+	true:false)
+		echo "  ok    READY -- initialized and unsealed, serving on ${BAO_ADDR:-the configured address}"
+		;;
+	*)
+		echo "  FAIL  the API did not answer, so this node is not serving:"
+		printf '%s\n' "$status" | head -3 | sed 's/^/        /'
+		fail=1
+		;;
+	esac
+	echo "        Anything that needs to know should poll GET /v1/sys/health rather than this:"
+	echo "        200 ready, 429 standby, 501 uninitialized, 503 sealed."
+else
+	echo "  ....  NOT READY -- OpenBao is not running; see above for why"
+fi
+
 echo "Host"
 # Load-bearing rather than hygiene. With mlock gone from OpenBao 2.x, keeping decrypted secret material
 # out of swap is entirely a property of there being no swap -- this is upstream's own guidance ("disable

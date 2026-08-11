@@ -18,8 +18,8 @@ The lab is not a Droplet. Nothing here has run on DigitalOcean.
 | packages | 109 | 93 |
 | kernel modules | 370, 11 MiB | 293, 6.4 MiB |
 | initramfs | 10,270 KiB | 5,440 KiB |
-| image | 219 MiB | 201 MiB |
-| compressed | 95 MiB | 71 MiB |
+| image content | 201 MiB | 185 MiB |
+| compressed | 95 MiB | 82 MiB |
 | offline checks | 116 | 166 |
 
 Size was the least of it. The reason to read this is the two defects in the middle.
@@ -155,6 +155,63 @@ The prune now reads the dependency closure out of `modules.dep`, the build treat
 as fatal, and `verify-image` asserts both the closure and that every dependency file still exists. The
 check that failed was replaced too: it demanded that `drivers/net` contain nothing but `virtio_net`,
 which is exactly the assertion that had to be wrong for the image to be right.
+
+## Boot time, and what it is actually made of
+
+Measured on a steady-state reboot in the lab, against the guest's own clock. **The absolute numbers are
+emulation and mean nothing** — this is TCG on an ARM host, roughly an order of magnitude off native — but
+the split between phases and the effect of a change are both real.
+
+| | Before | After |
+| --- | --- | --- |
+| SSH answering | 52s | 42s |
+| port 8200 listening | 60s | 48s |
+
+The only change was `rc_parallel="YES"`. OpenRC serialises the whole boot by default, so services with no
+relationship to each other waited for each other — DHCP on two interfaces, chronyd, crond and sshd have
+no reason to be sequential. It is safe here only because this image declares its dependencies with
+`need` rather than relying on start order. Verified over repeated reboots: no crashed service,
+`openbao-selfcheck` fully green, zero AppArmor denials.
+
+Where the rest goes, from `dmesg` gaps over 0.5s:
+
+```
+ 4.89 ->  6.98  (+2.09s)  kernel init, X.509 keyring
+ 7.48 ->  8.41  (+0.93s)  initramfs starting
+11.90 -> 14.65  (+2.74s)  root filesystem mount
+14.66 -> 20.91  (+6.25s)  device coldplug
+22.98 -> 25.19  (+2.20s)  AppArmor profile load
+25.57 -> 30.32  (+4.75s)  Raft volume mount
+```
+
+**Two things were tried and rejected.** Removing `hwdrivers` — the 6.25s coldplug, the largest single
+gap — changed nothing measurable, because `mdev` does the work either way; and it is what loads
+`virtio_rng`, which is entropy on a host that generates keys. Trimming the runlevels found nothing else
+worth removing: `swap` is a no-op on an image with no swap, and every other service has a caller.
+
+The honest conclusion is that the boot is not obviously slow. What makes it *look* slow is where it is
+usually watched: CI's boot test runs under TCG because GitHub-hosted runners do not expose `/dev/kvm`,
+and takes 67 seconds of a two-minute pipeline. A Droplet has hardware virtualisation and does not.
+
+## Readiness
+
+DigitalOcean has no readiness hook. A Droplet is `active` as soon as the hypervisor has started it,
+there is no callback, and nothing in `/etc/init.d` can change that — OpenRC reports a service `started`
+the moment `supervise-daemon` spawns it, which here is true while the node is sealed and serving
+nothing. `rc-service openbao status` says "started" throughout.
+
+The signal is OpenBao's own `/v1/sys/health`: 200 ready, 429 standby, 501 uninitialized, 503 sealed.
+Measured against 2.6.1 on the lab node — 200 unsealed, 503 after a restart. A DigitalOcean Load Balancer
+health check is the closest thing to the provider knowing; Terraform can poll the same path.
+
+`openbao-selfcheck` now reports it too, at the end of every boot, onto the serial console the recovery
+console shows — the one place an operator can see "sealed, waiting for you" without first being able to
+log in. All four states were exercised: not running, running but uninitialized, initialized but sealed,
+and ready.
+
+And the part no boot-time tuning reaches: **with the default Shamir seal a node cannot become ready on
+its own**, because unsealing needs a human with key shares. A Droplet that boots straight into service
+is a seal decision, not a performance one.
 
 ## Still unsettled
 

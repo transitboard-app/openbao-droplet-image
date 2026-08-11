@@ -196,6 +196,23 @@ done
 sed -i 's|^#\?rc_depend_strict=.*|rc_depend_strict="NO"|' /etc/rc.conf
 grep -q '^rc_depend_strict="NO"' /etc/rc.conf || echo 'rc_depend_strict="NO"' >> /etc/rc.conf
 
+# Start services in parallel. OpenRC defaults this off, so every service on this node waited for the one
+# before it whether or not it depended on it.
+#
+# Measured on a steady-state reboot in the lab, three runs each: SSH answering at 52s becomes 42s and
+# OpenBao's listener at 60s becomes 48s, both about 20% off. The absolute numbers are emulation and mean
+# nothing; the ratio is the point, and it comes from the parts of the boot that were always independent
+# -- DHCP on two interfaces, chronyd, crond and sshd have no reason to be serialised behind each other.
+#
+# This is only safe because the dependencies are declared rather than implied by order, which they now
+# are: openbao needs net, localmount, metadata and openbao-volume; cloud-ssh-keys needs metadata and
+# comes before sshd; openbao-volume comes before openbao. A service that relied on being started after
+# something it did not declare would break here, which is a reason to declare it, not a reason to
+# serialise the whole boot. Verified across reboots with no crashed service, openbao-selfcheck fully
+# green and zero AppArmor denials.
+sed -i 's|^#\?rc_parallel=.*|rc_parallel="YES"|' /etc/rc.conf
+grep -q '^rc_parallel="YES"' /etc/rc.conf || echo 'rc_parallel="YES"' >> /etc/rc.conf
+
 rc-update add net.lo boot
 rc-update add net.eth0 default
 rc-update add net.eth1 default
