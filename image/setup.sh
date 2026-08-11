@@ -55,6 +55,21 @@ install -d -o root -g "$BAO_GID" -m 0750 /etc/openbao/tls
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /var/lib/openbao
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /var/log/openbao
 
+# The configuration directory and the seal key directory, both root-owned with group read, for the same
+# reason /etc/openbao/tls is: root owns them so a confined root can traverse them without a capability,
+# and the openbao group reads them so the server can. The overlay has already put the fragments in
+# place; this fixes the ownership the copy could not set.
+#
+# /etc/openbao/seal ships empty and usually stays that way. It exists so that an operator installing a
+# static seal key has a directory with the right mode already waiting, rather than creating one by hand
+# and getting it wrong once.
+install -d -o root -g "$BAO_GID" -m 0750 /etc/openbao/config.d
+install -d -o root -g "$BAO_GID" -m 0750 /etc/openbao/seal
+for fragment in /etc/openbao/config.d/*.hcl; do
+	chown root:"$BAO_GID" "$fragment"
+	chmod 0640 "$fragment"
+done
+
 echo "==> kernel command line"
 # THE line without which the AppArmor profile in this image is decorative.
 #

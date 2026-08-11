@@ -81,6 +81,55 @@ elif [ "$configured" = 1 ]; then
 	echo "  ....  OpenBao is not running, so its privilege and confinement checks did not run"
 fi
 
+echo "Configuration"
+# Which fragments are actually loaded, reported rather than assumed. The service reads two directories
+# and the second is tmpfs, so "what is this server configured with" is not answerable from /etc alone --
+# and a user_data fragment that was silently skipped for the wrong reason is invisible otherwise.
+etc_fragments="$(find /etc/openbao/config.d -maxdepth 1 -name '*.hcl' 2>/dev/null | wc -l | tr -d ' ')"
+check "storage fragment present"     'test -f /etc/openbao/config.d/00-storage.hcl'
+check "listener fragment present"    'test -f /etc/openbao/config.d/10-listener.hcl'
+echo "  ....  $etc_fragments fragment(s) in /etc/openbao/config.d"
+if [ -f /run/openbao/config.d/50-user-data.hcl ]; then
+	echo "  ....  user_data loaded as a fragment"
+elif [ -s /run/metadata/user-data ]; then
+	# Not a failure: user_data without the sentinel is meant for something else and is correctly ignored.
+	# Said out loud anyway, because "I put it in user_data and nothing happened" is otherwise unanswerable
+	# without reading the init script.
+	echo "  ....  user_data present but not #openbao-config, so it was ignored"
+fi
+
+echo "Seal"
+# No seal is the image's default and is not a fault: OpenBao then uses Shamir, whose key material never
+# touches this node at all. That is the stronger arrangement at rest and the weaker one for availability,
+# and choosing between them is the operator's call rather than the image's.
+#
+# What IS a fault is the two of them disagreeing, which is the one state here nothing else catches. A
+# stanza naming a key that is absent stops the server, loudly, at start_pre. A key present that no stanza
+# names does the opposite: the server starts, unseals with Shamir, works perfectly, and leaves the key
+# that was supposed to be protecting it sitting unused on the disk. Every other signal on the node looks
+# healthy.
+seal_declared=0
+if grep -rqE '^[[:space:]]*seal[[:space:]]' /etc/openbao/config.d/ /run/openbao/config.d/ 2>/dev/null; then
+	seal_declared=1
+fi
+
+if [ -f /etc/openbao/seal/key ]; then
+	check "seal key is root-owned"   '[ "$(stat -c %u /etc/openbao/seal/key)" = 0 ]'
+	check "seal key group is 65532"  '[ "$(stat -c %g /etc/openbao/seal/key)" = 65532 ]'
+	check "seal key is 0640"         '[ "$(stat -c %a /etc/openbao/seal/key)" = 640 ]'
+	# The one way to get this file wrong that OpenBao reports as an unknown key encoding rather than as
+	# a malformed file. `openssl rand -base64 32 > key` produces it. See /etc/init.d/openbao.
+	check "seal key has no trailing newline" '[ -n "$(tail -c1 /etc/openbao/seal/key)" ]'
+	check "a seal stanza uses the key"       '[ "'"$seal_declared"'" = 1 ]'
+	[ "$seal_declared" = 1 ] || echo "        a key is installed but no fragment declares a seal, so it" \
+		"is ignored and this node is unsealing with Shamir shares"
+elif [ "$seal_declared" = 1 ]; then
+	# Legitimate: a transit or KMS seal holds no key file on the node, which is the point of it.
+	echo "  ....  a seal is declared with no key at /etc/openbao/seal/key -- transit or KMS"
+else
+	echo "  ....  no seal declared; this node unseals with Shamir shares"
+fi
+
 echo "Host"
 # Load-bearing rather than hygiene. With mlock gone from OpenBao 2.x, keeping decrypted secret material
 # out of swap is entirely a property of there being no swap -- this is upstream's own guidance ("disable

@@ -12,7 +12,13 @@ name="OpenBao"
 description="OpenBao secret control plane"
 
 command="/usr/sbin/bao"
-command_args="server -config=/etc/openbao/openbao.hcl"
+# Two directories rather than one file. `-config` takes a directory and loads every .hcl in it in
+# alphabetical order, and it may be given more than once -- so the image ships its fragments, the
+# operator adds fragments beside it, and start_pre() writes user_data into the second directory.
+#
+# /run is loaded last, and that is the point: it is tmpfs, so a fragment derived from user_data is
+# rebuilt at every start and can never be a stale file surviving a change nobody remembers making.
+command_args="server -config=/etc/openbao/config.d -config=/run/openbao/config.d"
 command_user="openbao:openbao"
 
 supervisor="supervise-daemon"
@@ -90,7 +96,7 @@ start_pre() {
 	# restart-loop against material the operator has not installed yet. Returning 1 here makes OpenRC
 	# report a clean failure with this message, which is what the operator needs to see on first boot.
 	#
-	# ca.crt is gated with the other two because openbao.hcl names it as tls_client_ca_file: without it
+	# ca.crt is gated with the other two because 10-listener.hcl names it as tls_client_ca_file: without it
 	# the server does not fail this check and then refuses to load, which reads as a configuration bug
 	# rather than as a missing file.
 	if [ ! -f /etc/openbao/tls/server.crt ] || [ ! -f /etc/openbao/tls/server.key ] ||
@@ -113,6 +119,66 @@ start_pre() {
 	chown root:openbao /etc/openbao/tls/server.crt /etc/openbao/tls/server.key /etc/openbao/tls/ca.crt
 	chmod 0640 /etc/openbao/tls/server.key
 	chmod 0644 /etc/openbao/tls/server.crt /etc/openbao/tls/ca.crt
+
+	# The seal key, if this node has been given one. Absent is not an error: with no `seal` stanza
+	# anywhere OpenBao uses Shamir, which is the image's default and needs no file.
+	#
+	# root:openbao 0640, for the same reason as server.key and applied here rather than left to an
+	# operator's `scp` -- this is the one file on the node that decrypts the Raft store, and a
+	# world-readable copy of it is the mistake that would not announce itself.
+	if [ -f /etc/openbao/seal/key ]; then
+		chown root:openbao /etc/openbao/seal/key
+		chmod 0640 /etc/openbao/seal/key
+
+		# A trailing newline in this file is a fatal configuration error, and the message OpenBao gives
+		# for it names neither the file nor the cause:
+		#
+		#   Error configuring seal "static": unknown encoding for AES-256 key: must be either a raw,
+		#   hex, or base64-encoded
+		#
+		# `openssl rand -base64 32 > key` produces exactly that, which makes this the most likely way to
+		# get the file wrong on the first try. Measured against OpenBao 2.6.1. Refused rather than
+		# trimmed, because silently rewriting an operator's key material is worse than saying so.
+		#
+		# The test reads oddly and is correct: command substitution strips trailing newlines, so a file
+		# ending in one yields an empty string here and a file ending in a real character does not.
+		if [ -z "$(tail -c1 /etc/openbao/seal/key)" ]; then
+			eerror "/etc/openbao/seal/key ends with a newline, which OpenBao rejects as an unknown"
+			eerror "key encoding. Write it without one:"
+			eerror "  printf %s \"\$key\" > /etc/openbao/seal/key"
+			return 1
+		fi
+	fi
+
+	# DigitalOcean user_data, turned into a configuration fragment.
+	#
+	# /run is tmpfs, so this directory is rebuilt from scratch at every start and a fragment cannot
+	# outlive the user_data that produced it. The alternative -- writing into /etc -- leaves a stale file
+	# behind the moment user_data shrinks, which is the failure that is impossible to see in a diff.
+	install -d -o root -g openbao -m 0750 /run/openbao/config.d
+	rm -f /run/openbao/config.d/50-user-data.hcl
+	if [ -s /run/metadata/user-data ]; then
+		# A sentinel first line, so that a Droplet created with user_data meant for something else is
+		# ignored rather than fatal. Without it, any unrelated document -- a cloud-config someone pasted
+		# out of habit -- becomes a configuration parse error that stops the secret store from starting.
+		if [ "$(head -n1 /run/metadata/user-data)" = "#openbao-config" ]; then
+			# ASCII only, checked rather than assumed. DigitalOcean does not deliver user_data as UTF-8:
+			# a single multi-byte character is enough to corrupt the document in transit, and the
+			# em-dash that did it last time was in a comment. Caught here, it names the cause; left to
+			# OpenBao, it is a parse error pointing at a line that looks fine.
+			if [ -n "$(tr -d '\000-\177' < /run/metadata/user-data)" ]; then
+				eerror "user_data contains non-ASCII characters, which DigitalOcean does not deliver"
+				eerror "intact. Rewrite it in ASCII -- including its comments -- and rebuild the Droplet."
+				return 1
+			fi
+			cp /run/metadata/user-data /run/openbao/config.d/50-user-data.hcl
+			chown root:openbao /run/openbao/config.d/50-user-data.hcl
+			chmod 0640 /run/openbao/config.d/50-user-data.hcl
+			einfo "Loaded user_data as a configuration fragment"
+		else
+			einfo "user_data is not #openbao-config; ignoring it"
+		fi
+	fi
 
 	# The Raft volume and the metadata read used to live here. Both are now services of their own --
 	# /etc/init.d/openbao-volume and /etc/init.d/metadata -- declared with `need` in depend() above, so a

@@ -85,6 +85,35 @@ snapshot cannot be written on the node at all, so snapshots are taken through st
 which is how the command is meant to be used — it is an API client, not a node-local tool. Anything that
 makes an operator reach for `-tls-skip-verify` is a bug in this image, not an operator error.
 
+**Configuration is a directory, and `user_data` is the last layer of it.** `-config` takes a directory
+and may be given twice, so the service loads `/etc/openbao/config.d` then `/run/openbao/config.d`, and
+`start_pre()` writes `user_data` into the second. Stanzas that may repeat — `listener`, `audit`,
+`initialize` — append across files; everything else is last-wins, so a `user_data` fragment overrides the
+node. Measured against 2.6.1: two `initialize` stanzas in two different directories both execute, in file
+order. `/run` is tmpfs on purpose — a fragment in `/etc` would outlive the `user_data` that produced it
+the moment `user_data` shrank, which is the kind of stale state that is invisible in a diff.
+
+**Appending is why the image ships three fragments and not one.** `audit` and `listener` append, so a
+user's fragment cannot switch off what the image declares — measured: an `audit` block in a second
+fragment enables a *second* device, it does not replace the first. One combined file would therefore make
+every default in it unremovable. Split by concern —  `00-storage.hcl`, `10-listener.hcl`, `20-audit.hcl` —
+each can be overwritten or deleted on its own, and each says in its header whether it is structural
+(coupled to `openbao-volume`, the AppArmor profile or the TLS gate) or a default. Do not recombine them.
+
+**The image must ship no `seal` stanza.** Without one OpenBao uses Shamir, which needs no key material
+present and is the right default for an image other people boot — and it fails closed, since an
+uninitialized node serves nothing. Shipping one would make every node without a key file refuse to load,
+turning the default case into a failure; it would rule out the transit and KMS seals, which have no key
+file to give; and it would mandate the *weakest* at-rest option, because a static key lives on the disk it
+decrypts while Shamir shares never touch the node. `verify-image` asserts the absence across the whole
+directory.
+
+**A static seal key with a trailing newline is a fatal error that names neither the file nor the cause.**
+`openssl rand -base64 32 > key` produces one, and OpenBao answers
+`unknown encoding for AES-256 key: must be either a raw, hex, or base64-encoded`. Measured against 2.6.1.
+`start_pre()` refuses to start and says how to fix it; `openbao-selfcheck` checks it too. Do not "fix"
+this by trimming the file — silently rewriting an operator's key material is worse than refusing.
+
 **The audit device does not rotate itself, and a full root filesystem is an outage.** Upstream is
 explicit: the `file` device "does not currently assist with any log rotation", and a `SIGHUP` makes it
 close and reopen. OpenBao refuses requests when every audit device fails to write, so an unbounded audit
@@ -101,8 +130,10 @@ signal path it depends on. Do not remove either without replacing what it does.
   adding one, and say in `image/packages` why anything new is needed.
 - Do not add a shell, an interpreter, or a package manager. `preStop`-style conveniences are not worth
   what they cost here, and `verify-image` will reject them.
-- Keep runtime files ASCII-only. They do not travel through DigitalOcean's `user_data` path today, but
-  the habit is cheap and that path discards a whole document over one multi-byte character.
+- Keep runtime files ASCII-only. This is no longer only a habit: since the image loads `user_data` as a
+  configuration fragment, that path is live, and DigitalOcean discards a whole document over one
+  multi-byte character. `/etc/init.d/openbao` refuses to start on a non-ASCII fragment rather than
+  letting it surface as a parse error pointing at a line that looks fine.
 - Do not add a `Co-Authored-By` trailer, or any other tool-attribution trailer, to a commit.
 - Bump `OPENBAO_IMAGE` and `BAO_SHA256` together, and keep them in step with
   `stack/infrastructure/platform/variables.tf`.

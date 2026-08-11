@@ -86,12 +86,42 @@ check "no previous extlinux conf" "! test -e $R/boot/extlinux.conf.old"
 echo "==> OpenBao"
 check "binary installed"          "test -x $R/usr/sbin/bao"
 check "binary is root-owned"      "[ \"\$(stat -c %u $R/usr/sbin/bao)\" = 0 ]"
-check "config present"            "test -f $R/etc/openbao/openbao.hcl"
+check "storage fragment present"  "test -f $R/etc/openbao/config.d/00-storage.hcl"
+check "listener fragment present" "test -f $R/etc/openbao/config.d/10-listener.hcl"
+check "audit fragment present"    "test -f $R/etc/openbao/config.d/20-audit.hcl"
+# Three files rather than one, so each default can be replaced or deleted on its own. `listener` and
+# `audit` APPEND across fragments rather than overriding -- measured against 2.6.1, a second audit block
+# enables a second device -- so a combined file would make the image's choices unremovable.
+check "fragments are separate"    "! test -e $R/etc/openbao/config.d/00-appliance.hcl"
+# The single-file config was replaced by a directory. Asserted as an absence too, because a file left at
+# the old path would not be loaded and nothing else would say so -- the server would start on the
+# fragments it did find and quietly serve a configuration nobody wrote.
+check "no config at the old path" "! test -e $R/etc/openbao/openbao.hcl"
+check "service loads /etc frags"  "grep -q 'config=/etc/openbao/config.d' $R/etc/init.d/openbao"
+check "service loads user_data"   "grep -q 'config=/run/openbao/config.d' $R/etc/init.d/openbao"
 # Not a hardening preference any more but a boot gate: OpenBao 2.x rejects `disable_mlock = false` as a
 # fatal configuration error, and supervise-daemon respawns the failure until it gives up. Absent is the
 # only spelling that both loads and tells the truth. See the note in the config itself.
-check "disable_mlock absent"      "! grep -qE '^[^#]*disable_mlock' $R/etc/openbao/openbao.hcl"
-check "audit device declared"     "grep -q 'audit \"file\"' $R/etc/openbao/openbao.hcl"
+check "disable_mlock absent"      "! grep -rqE '^[^#]*disable_mlock' $R/etc/openbao/config.d/"
+check "audit device declared"     "grep -q 'audit \"file\"' $R/etc/openbao/config.d/20-audit.hcl"
+# The image must ship no seal stanza in any fragment, so an unconfigured node uses Shamir and starts.
+# Shipping one would make every node without a key file refuse to load -- turning the default case into a
+# failure -- and would rule out the transit and KMS seals, which have no key file to give. It would also
+# mandate the WEAKEST at-rest option: a static key lives on the disk it decrypts, where Shamir shares
+# never touch the node at all. Auto-unseal is opted into with a fragment; README.md has the trade.
+check "no seal stanza shipped"    "! grep -rqE '^[[:space:]]*seal[[:space:]]' $R/etc/openbao/config.d/"
+# Off unless asked. The one setting here that was pure preference rather than something the appliance
+# needs, and an appliance shipping no shell should not serve a web console by default.
+check "ui not enabled"            "! grep -rqE '^[[:space:]]*ui[[:space:]]*=[[:space:]]*true' $R/etc/openbao/config.d/"
+# Same ownership argument as the TLS directory below: root owns it so a confined root can traverse it
+# without a capability, and the openbao group reads it so the server can.
+check "config dir is root-owned"  "[ \"\$(stat -c %u $R/etc/openbao/config.d)\" = 0 ]"
+check "config dir group is 65532" "[ \"\$(stat -c %g $R/etc/openbao/config.d)\" = 65532 ]"
+check "config dir is 0750"        "[ \"\$(stat -c %a $R/etc/openbao/config.d)\" = 750 ]"
+check "seal dir present"          "test -d $R/etc/openbao/seal"
+check "seal dir is 0750"          "[ \"\$(stat -c %a $R/etc/openbao/seal)\" = 750 ]"
+# Shipping a key would make every Droplet booting this image share one, and it is a public image.
+check "no seal key shipped"       "! test -e $R/etc/openbao/seal/key"
 check "openbao user is 65532"     "grep -q '^openbao:x:65532:' $R/etc/passwd"
 check "openbao user has nologin"  "grep '^openbao:' $R/etc/passwd | grep -q nologin"
 # root:openbao 0750, not 65532:65532 0700. Owned by the uid OpenBao runs as, the directory holding its

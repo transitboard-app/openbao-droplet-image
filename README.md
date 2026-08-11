@@ -150,6 +150,96 @@ recorded against the server. It is the difference between the image being config
 node being correct. It also runs at the end of every boot, so its verdict is on the serial console
 DigitalOcean's recovery console shows without anyone having to ask for it.
 
+### Configuring a node
+
+The image reads two directories, so nothing here needs editing in place:
+
+| Loaded | Holds | Written by |
+| --- | --- | --- |
+| `/etc/openbao/config.d/00-storage.hcl` | the Raft store — **structural** | the image |
+| `/etc/openbao/config.d/10-listener.hcl` | the API listener and TLS paths — **structural** | the image |
+| `/etc/openbao/config.d/20-audit.hcl` | the file audit device — a **default** | the image |
+| `/etc/openbao/config.d/*.hcl` | anything else this node needs | you, over `scp` |
+| `/run/openbao/config.d/50-user-data.hcl` | the same, from DigitalOcean `user_data` | the service, at every start |
+
+`bao server -config=<dir>` loads every `.hcl` in a directory in alphabetical order, and the service passes
+both directories with `/run` last.
+
+**Overriding works for some settings and not others.** Settings that may appear once — `ui`, `storage`,
+`default_lease_ttl` — are last-wins, so a later fragment replaces an earlier one. Stanzas that may repeat
+— `listener`, `audit`, `initialize` — are **appended**. A second `audit` block does not replace the one
+the image ships; it enables a second device alongside it. So a fragment of yours cannot switch off what
+this directory already declares: to replace one of the image's defaults, overwrite or delete that file.
+That is why they are three files named by concern rather than one.
+
+The two marked **structural** are coupled to the rest of the image — `00-storage.hcl` to the
+`openbao-volume` service that mounts the attached volume there and to the AppArmor profile that grants
+writes on exactly that path, and `10-listener.hcl` to the TLS gate in the service's `start_pre`. Change
+either and those stop applying. `20-audit.hcl` is a plain default: delete it, or replace it to send audit
+elsewhere. It ships enabled because OpenBao 2.x cannot enable an audit device through the API at all, so
+a node without one has no way to gain one without a restart.
+
+`user_data` must begin with the line `#openbao-config`. Without it the document is ignored rather than
+loaded, so a Droplet created with `user_data` meant for something else does not end up with a secret store
+that refuses to start. It must also be ASCII: DigitalOcean does not deliver `user_data` as UTF-8, and one
+multi-byte character — an em-dash in a comment is the way this actually happens — corrupts the whole
+document. The service checks both and says which one failed.
+
+**`user_data` is root-equivalent on this node**: a fragment can add a `seal` stanza, an `initialize`
+stanza or a second `listener`, which is the whole point of it. Two things follow. Any process on the
+Droplet can read it back from the metadata service at `169.254.169.254`, so it is not a private channel
+to the server. And if you create Droplets with Terraform or OpenTofu, `user_data` is an ordinary
+attribute that is stored in state — the DigitalOcean provider offers no write-only variant, checked
+against the installed provider schema — so anything you put there is in your state file too.
+
+DigitalOcean's Droplet API does **not** return `user_data` on retrieve, so a plain API token does not read
+it back; that has been [asked for and not shipped](https://github.com/digitalocean/api-v2/issues/121).
+Treat it as configuration that is visible to your state file and to the node, and keep key material out
+of it on those grounds rather than on the provider's.
+
+### Sealing
+
+By default a node uses **Shamir shares**: `bao operator init` once, and three of five shares to unseal
+after every restart. That needs no key material on the node and no decision made in advance, which is why
+the image ships no `seal` stanza at all.
+
+For unattended boot, the built-in option that needs no external KMS is the **static seal**. Install a
+32-byte key and add a fragment naming it:
+
+```bash
+# On a machine you trust -- NOT on the node, and keep a copy in your password manager
+openssl rand -base64 32 | tr -d '\n' > seal-key
+scp seal-key root@<node>:/etc/openbao/seal/key
+```
+
+```hcl
+# /etc/openbao/config.d/10-seal.hcl, or the same lines in user_data
+seal "static" {
+  current_key_id = "<any name>"
+  current_key    = "file:///etc/openbao/seal/key"
+}
+```
+
+The `file://` reference is what keeps the fragment identical on every node: only the file's contents
+differ. The service applies `root:openbao 0640` to the key itself, so the `scp` above cannot get it wrong.
+
+**Write the key without a trailing newline.** `openssl rand -base64 32 > seal-key` produces one, and
+OpenBao rejects it with `unknown encoding for AES-256 key`, naming neither the file nor the cause. The
+`tr -d '\n'` above is the fix; the service refuses to start rather than let you discover it from that
+message, and `openbao-selfcheck` checks it too.
+
+Understand what this trades before choosing it. The key decrypts the Raft store and lives on the same
+Droplet, so a snapshot of the whole host carries both — where Shamir shares kept off the machine mean a
+stolen disk is useless. It does **not** weaken anything against an attacker with root on a running node,
+who already reaches unsealed material in memory. And it does not remove custody: the key still has to be
+somewhere safe, because restoring a snapshot onto a new node needs it.
+
+Two consequences of auto-unseal worth knowing before you turn it on. It is what makes OpenBao's
+[self-initialization](https://openbao.org/docs/configuration/self-init/) usable, so a node can come up
+fully configured with no `bao operator init` at all — and self-init generates **no recovery keys** and
+revokes the root token after use. If you take that path, make sure the credential self-init creates is one
+you can keep, and generate recovery keys with `sys/rotate/recovery/init` once you can authenticate.
+
 ### Operator commands run under the AppArmor profile
 
 A profile attaches to a path, so `profile openbao /usr/sbin/bao` confines **every** execution of that

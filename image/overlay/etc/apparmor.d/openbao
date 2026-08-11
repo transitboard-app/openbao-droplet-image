@@ -32,10 +32,17 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
 
   /usr/sbin/bao mr,
 
-  # Configuration and TLS material. Read-only: OpenBao has no business rewriting its own config, and
-  # the private key should be unreachable for writing even to the process that uses it.
+  # Configuration, TLS material and the seal key. Read-only: OpenBao has no business rewriting its own
+  # config, and neither the private key nor the seal key should be reachable for writing even by the
+  # process that uses them.
   /etc/openbao/ r,
   /etc/openbao/** r,
+
+  # The second configuration directory, written by the service's start_pre from DigitalOcean user_data.
+  # Read-only here for the same reason as /etc: the fragment is produced by root before the server
+  # starts, and the server only consumes it.
+  /run/openbao/ r,
+  /run/openbao/** r,
 
   # The Raft store. `k` grants file locking, which the storage backend needs and whose absence shows up
   # as a startup failure rather than as a permission error.
