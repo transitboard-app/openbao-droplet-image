@@ -434,6 +434,21 @@ fi
 #               error rather than an addressing one.
 #   scsi-hd     the Raft volume, presented as vendor DO / model Volume, which is what openbao-volume
 #               scans /sys/block/sd* for. The Droplet's own disk stays virtio, so it is not a candidate.
+#   virtio-rng  an entropy source, and its absence was costing 13.9 seconds of every run.
+#
+# That last one was found by reading the kernel timestamps in a boot log rather than by reasoning about
+# the recipe, and it is worth stating plainly: with no RNG device the guest sat at
+# `random: crng init done` for 13.9s -- measured on a KVM-accelerated runner, 6.49s to 20.39s, the
+# largest gap in the whole boot by an order of magnitude. Everything that wants randomness waits behind
+# it, including sshd generating its host keys on first boot.
+#
+# It is also a fidelity bug and not merely a slow one. The lab this test is modelled on passes
+# virtio-rng, and image/setup.sh deliberately keeps the virtio-rng modules "because this host generates
+# keys and wants entropy" -- so the boot test was the one place in this repository presenting a machine
+# less capable than the one the image is written for, and it was doing so silently.
+#
+# The boot test always pays first-boot entropy cost because boot:prepare copies a fresh image every run,
+# so `seedrng` has no saved seed to credit. A real Droplet only pays it once.
 qemu-system-x86_64 \
 	-machine q35 -m 1024 -smp 2 \
 	-drive file={{ vars.boot_work }}/disk.qcow2,format=qcow2,if=none,id=root \
@@ -444,6 +459,7 @@ qemu-system-x86_64 \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 	-netdev "user,id=n1,net=169.254.169.0/24,host=169.254.169.1,dhcpstart=169.254.169.20,guestfwd=tcp:169.254.169.254:80-cmd:{{ config_root }}/scripts/fake-metadata" \
 	-device virtio-net-pci,netdev=n1 \
+	-device virtio-rng-pci \
 	-nographic -display none -serial file:"$log" >/dev/null 2>&1 &
 qemu=$!
 
