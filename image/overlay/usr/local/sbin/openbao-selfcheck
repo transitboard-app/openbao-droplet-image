@@ -239,6 +239,19 @@ else
 fi
 
 echo "Host"
+# How long this node took to get here, from the node itself.
+#
+# There was no way to ask. A boot timed from outside includes QEMU or the hypervisor starting, and on a
+# developer's machine it includes emulation that is an order of magnitude off -- so "is this slow?" had
+# no answer that survived being asked on different hardware. This runs at the end of the boot, so the
+# number lands on the serial console DigitalOcean's recovery console shows, on the real machine, with no
+# instrumentation and nothing to install.
+#
+# Reported rather than checked: there is no threshold worth failing on, and a node that boots slowly is
+# information rather than a fault.
+printf '  ....  up %.1fs when this ran (idle %.1fs)\n' \
+	"$(cut -d' ' -f1 /proc/uptime)" "$(cut -d' ' -f2 /proc/uptime)" 2>/dev/null ||
+	echo "  ....  uptime unavailable"
 # Load-bearing rather than hygiene. With mlock gone from OpenBao 2.x, keeping decrypted secret material
 # out of swap is entirely a property of there being no swap -- this is upstream's own guidance ("disable
 # or encrypt swap instead") and the only thing standing where mlock used to.

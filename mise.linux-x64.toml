@@ -513,6 +513,11 @@ run = [
 	# reached the console. It cannot assert the verdict -- under QEMU there is no metadata service, so
 	# OpenBao is correctly not running and the check says so rather than passing or failing.
 	"""grep -q "openbao-selfcheck:" {{ vars.boot_work }}/boot.log || { echo "FATAL: openbao-selfcheck never ran at boot" >&2; exit 1; }""",
+	# The guest's own answer to "how long did that take", which is the only one worth comparing across
+	# runs: the wall clock outside includes QEMU starting and, on a developer's machine, emulation an
+	# order of magnitude off the truth. Printed rather than asserted -- there is no threshold here worth
+	# failing a build on, and a runner having a bad minute is not a broken image.
+	"""grep -o "up [0-9.]*s when this ran" {{ vars.boot_work }}/boot.log | head -1 | sed 's/^/guest boot: /' || true""",
 	"""echo "boot: AppArmor enforcing, metadata read, key installed, Raft volume mounted, TLS gate held" """,
 ]
 
