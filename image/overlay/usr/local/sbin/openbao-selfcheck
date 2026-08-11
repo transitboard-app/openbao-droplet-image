@@ -53,17 +53,29 @@ done
 # to start until an operator has installed TLS material, so on a node that has not had it yet OpenBao is
 # correctly absent -- and a check that reports the intended first-boot state as a fault is one people
 # learn to skip.
+#
+# **Three states, not two, since TLS moved to the attached volume**: no volume, volume but no TLS, and
+# configured. Collapsing the first two would report a failed mount as an un-provisioned node, which is the
+# difference between "install the certificate" and "the disk is not there".
 configured=0
-if [ -f /etc/openbao/tls/server.crt ]; then
+if ! mountpoint -q /var/lib/openbao; then
+	echo "  FAIL  the Raft volume is not mounted, so nothing below can be true"
+	echo "        see rc-service openbao-volume status; OpenBao must never run on the Droplet's own disk"
+	fail=1
+elif [ -f /var/lib/openbao/tls/server.crt ]; then
 	configured=1
 fi
 
 if [ "$configured" = 0 ]; then
-	echo "  ....  no TLS material in /etc/openbao/tls, so OpenBao is correctly not running yet"
+	echo "  ....  no TLS material in /var/lib/openbao/tls, so OpenBao is correctly not running yet"
 	echo "        install it and start the service; README.md has the procedure"
 else
 	check "running"                   '[ -n "'"$pid"'" ]'
 fi
+
+# The old location, asserted as an absence. An `scp` to /etc/openbao/tls would succeed if someone created
+# it by hand, and the node would still refuse to start naming a directory that looked right.
+check "no TLS on the boot disk"      '[ ! -e /etc/openbao/tls ]'
 
 if [ -n "$pid" ]; then
 	# No capabilities, which is the correct assertion now that there is nothing to grant one for.
@@ -89,6 +101,18 @@ etc_fragments="$(find /etc/openbao/config.d -maxdepth 1 -name '*.hcl' 2>/dev/nul
 check "storage fragment present"     'test -f /etc/openbao/config.d/00-storage.hcl'
 check "listener fragment present"    'test -f /etc/openbao/config.d/10-listener.hcl'
 echo "  ....  $etc_fragments fragment(s) in /etc/openbao/config.d"
+# Where the listener's certificate comes from, which is not a question with an obvious default. OpenBao
+# 2.6.1 turns ACME ON when tls_cert_file is empty, aimed at Let's Encrypt production -- so a replaced
+# listener fragment that merely forgets the certificate does not fail, it starts talking to a public CA
+# and takes a temporary bind on port 80 for the HTTP-01 challenge. A node reached over a private address
+# can never complete that challenge, so it retries forever while every other signal here looks healthy.
+if grep -rqE '^[[:space:]]*tls_cert_file[[:space:]]*=' /etc/openbao/config.d/ /run/openbao/config.d/ 2>/dev/null; then
+	echo "  ....  listener TLS from a certificate file"
+else
+	echo "  ....  listener TLS from ACME -- no fragment sets tls_cert_file, so OpenBao is requesting"
+	echo "        a certificate from a public CA. Intended only if this node is publicly reachable."
+fi
+
 if [ -f /run/openbao/config.d/50-user-data.hcl ]; then
 	echo "  ....  user_data loaded as a fragment"
 elif [ -s /run/metadata/user-data ]; then
@@ -137,10 +161,8 @@ echo "Host"
 check "no swap active"               '[ "$(awk "NR>1" /proc/swaps | wc -l)" -eq 0 ]'
 check "core dumps discarded"         'grep -q "/bin/false" /proc/sys/kernel/core_pattern'
 check "ptrace_scope is 3"            '[ "$(cat /proc/sys/kernel/yama/ptrace_scope)" = "3" ]'
-# Mounted by the service's start_pre, so it is only expected once the service has been able to start.
-if [ "$configured" = 1 ]; then
-	check "raft volume mounted"      'mountpoint -q /var/lib/openbao'
-fi
+# Checked above, before anything that depends on it -- the mount now carries TLS as well as the store, so
+# its absence is the first thing to report rather than a consequence noticed later.
 check "no package manager"           '! command -v apk'
 check "no shell for openbao user"    'grep "^openbao:" /etc/passwd | grep -q nologin'
 

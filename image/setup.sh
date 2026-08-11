@@ -29,7 +29,8 @@ install -m 0644 -o root -g root /mnt/provenance /etc/openbao-binary-provenance
 # above.
 
 install -d -o root -g root -m 0755 /etc/openbao
-# root:openbao 0750, NOT 65532:65532 0700, and the difference is every operator command on the node.
+# Everything OpenBao reads is root-owned with group read -- NOT 65532:65532 0700 -- and the difference is
+# every operator command on the node.
 #
 # An AppArmor profile attaches to a path, so `profile openbao /usr/sbin/bao` confines the CLI an operator
 # runs by hand exactly as it confines the server -- and the profile grants no capability of any kind.
@@ -51,8 +52,19 @@ install -d -o root -g root -m 0755 /etc/openbao
 # most careful about -- left the process able to rewrite its own TLS material. It no longer can, whatever
 # AppArmor is doing. /etc/init.d/openbao applies the same ownership to the files themselves on every
 # start, so an operator's `scp` cannot get it wrong.
-install -d -o root -g "$BAO_GID" -m 0750 /etc/openbao/tls
-install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /var/lib/openbao
+#
+# **No /etc/openbao/tls.** TLS material lives on the attached volume since 2026-08-11, at
+# /var/lib/openbao/tls, so that a replacement Droplet reattaches it instead of an operator copying a key
+# back. Leaving the old directory here would be worse than deleting it: an `scp` to the old path would
+# succeed and the node would still refuse to start, naming a directory that looked correct.
+# scripts/verify-image asserts its absence.
+#
+# The mountpoint, root-owned with group read rather than owned by the uid OpenBao runs as. That is what
+# lets TLS live on this volume at all: the AppArmor profile attaches to /usr/sbin/bao and grants no
+# capability, so a confined `bao` run by root cannot traverse a 0700 directory owned by 65532 -- which is
+# the failure this ownership was chosen to avoid in the first place. /etc/init.d/openbao-volume creates
+# the subdirectories after mounting, with Raft owning its own.
+install -d -o root -g "$BAO_GID" -m 0750 /var/lib/openbao
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /var/log/openbao
 
 # The configuration directory and the seal key directory, both root-owned with group read, for the same

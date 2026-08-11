@@ -68,9 +68,40 @@ start() {
 	mount -t ext4 -o defaults,noatime "$device" /var/lib/openbao
 	eend $? "Could not mount the Raft volume; OpenBao must not start on the Droplet's own disk" || return 1
 
+	# Refuse a volume from before the layout changed, rather than quietly starting an empty store.
+	#
+	# Raft used to write directly into the mountpoint, so a pre-2026-08-11 volume has `data/` absent and
+	# `raft/` or `node-id` at the top level. Mounting it and pointing OpenBao at `data/` would find
+	# nothing, initialize a **new** store on the same disk, and leave the old one sitting beside it --
+	# every policy, role and KV entry still on the volume and invisible. That is the one failure a secret
+	# store cannot absorb, so it is a hard stop with the migration spelled out.
+	if [ ! -d /var/lib/openbao/data ] && { [ -e /var/lib/openbao/raft ] || [ -e /var/lib/openbao/node-id ]; }; then
+		eerror "This volume has the pre-2026-08-11 layout: Raft data at the top level, no data/."
+		eerror "Starting would initialize an empty store beside it. Move it first:"
+		eerror "  mkdir -p /var/lib/openbao/data"
+		eerror "  mv /var/lib/openbao/raft /var/lib/openbao/node-id /var/lib/openbao/data/"
+		eerror "  chown -R 65532:65532 /var/lib/openbao/data"
+		return 1
+	fi
+
 	# Applied after the mount, not before: it has to land on the mounted filesystem rather than on the
 	# empty directory underneath it. Idempotent, so this is safe on every start.
-	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao
+	#
+	# **The mountpoint is root:openbao 0750, not 65532:65532 0700, and that is what makes TLS on this
+	# volume possible at all.** The AppArmor profile attaches to /usr/sbin/bao and grants no capability, so
+	# a confined `bao` run by root cannot traverse a directory owned by 65532 and moded 0700 -- the exact
+	# failure /etc/openbao is shaped to avoid, where `bao status` could not read its own CA. Root owns the
+	# mountpoint and the openbao group reads it; Raft gets a subdirectory of its own that it does own.
+	install -d -o root -g 65532 -m 0750 /var/lib/openbao
+	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao/data
+
+	# TLS, and the reason any of this moved. On the boot disk it did not survive the Droplet, so replacing
+	# a node meant copying a key back before OpenBao could start. Here it reattaches with the volume.
+	#
+	# root-owned with group read, so OpenBao can read its own certificate and cannot rewrite it. The seal
+	# key deliberately stays on the boot disk: it is what makes a snapshot of THIS volume useless on its
+	# own, and moving it here would put the ciphertext and its key on one disk.
+	install -d -o root -g 65532 -m 0750 /var/lib/openbao/tls
 }
 
 stop() {

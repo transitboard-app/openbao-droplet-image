@@ -96,14 +96,22 @@ start_pre() {
 	# restart-loop against material the operator has not installed yet. Returning 1 here makes OpenRC
 	# report a clean failure with this message, which is what the operator needs to see on first boot.
 	#
+	# **On the attached volume since 2026-08-11, not the boot disk**, which is what makes replacing a
+	# Droplet cheap: the certificate is about OpenBao's name rather than the node's address, so it is still
+	# valid, and it comes back with the volume rather than being copied. `need openbao-volume` in depend()
+	# is what guarantees the mount is there before this looks. The seal key did NOT move -- it stays on the
+	# boot disk so a snapshot of the volume is useless on its own. See D23.
+	#
 	# ca.crt is gated with the other two because 10-listener.hcl names it as tls_client_ca_file: without it
 	# the server does not fail this check and then refuses to load, which reads as a configuration bug
 	# rather than as a missing file.
-	if [ ! -f /etc/openbao/tls/server.crt ] || [ ! -f /etc/openbao/tls/server.key ] ||
-		[ ! -f /etc/openbao/tls/ca.crt ]; then
-		eerror "No TLS material in /etc/openbao/tls."
-		eerror "Generate it with stack's scripts/generate-openbao-tls <node-private-address>,"
-		eerror "copy server.crt, server.key and ca.crt here, then start again."
+	if [ ! -f /var/lib/openbao/tls/server.crt ] || [ ! -f /var/lib/openbao/tls/server.key ] ||
+		[ ! -f /var/lib/openbao/tls/ca.crt ]; then
+		eerror "No TLS material in /var/lib/openbao/tls."
+		eerror "Generate it with stack's scripts/generate-openbao-tls <openbao-dns-name>,"
+		eerror "copy server.crt, server.key and ca.crt there, then start again."
+		eerror "That directory is on the attached volume, so it only needs doing once per volume --"
+		eerror "a replacement Droplet reattaches it and this gate is already satisfied."
 		return 1
 	fi
 
@@ -116,9 +124,9 @@ start_pre() {
 	#
 	# The key is 0640 and the certificates 0644, which is also why this is not a blanket chmod: a
 	# world-readable private key is the one mistake here that would not announce itself.
-	chown root:openbao /etc/openbao/tls/server.crt /etc/openbao/tls/server.key /etc/openbao/tls/ca.crt
-	chmod 0640 /etc/openbao/tls/server.key
-	chmod 0644 /etc/openbao/tls/server.crt /etc/openbao/tls/ca.crt
+	chown root:openbao /var/lib/openbao/tls/server.crt /var/lib/openbao/tls/server.key /var/lib/openbao/tls/ca.crt
+	chmod 0640 /var/lib/openbao/tls/server.key
+	chmod 0644 /var/lib/openbao/tls/server.crt /var/lib/openbao/tls/ca.crt
 
 	# The seal key, if this node has been given one. Absent is not an error: with no `seal` stanza
 	# anywhere OpenBao uses Shamir, which is the image's default and needs no file.

@@ -62,8 +62,14 @@ instead, and still refuses to guess unless there is exactly one match.
 
 **`deny` beats `allow` in AppArmor, regardless of specificity.** A blanket `deny /** w` in the profile
 would override the `/var/lib/openbao/** rwk` grant and OpenBao could not write its own Raft store.
-Confinement comes from the whitelist, not from blanket denials. Only `deny /** x` is safe, because
-nothing is granted exec anywhere.
+Confinement comes from the whitelist, not from blanket denials.
+
+**The rule is about blanket denials, not about denials** — it used to say "only `deny /** x` is safe" and
+that was too strong. A deny scoped to a path nothing is meant to write is exactly right, and the profile
+now carries one: `deny /var/lib/openbao/tls/** w`, because TLS moved onto the Raft volume and the `rwk`
+grant above it would otherwise let OpenBao rewrite its own private key. What makes that safe is that it
+overrides no grant anything needs; what made `deny /** w` unsafe is that it overrode one. Check what a
+deny would shadow before adding it, and keep denials narrow.
 
 **A dependency cannot be declared on the metadata service, so exactly one service waits for it.**
 `need net` means an interface is configured. It cannot mean "the hypervisor is answering HTTP on
@@ -78,9 +84,14 @@ store. Assert the wait once, or it will be got wrong twice.
 **The AppArmor profile confines the CLI as well as the server, because a profile attaches to a path.**
 `profile openbao /usr/sbin/bao` covers every execution of that binary, including the one an operator
 types. This is not a mistake to fix by adding a second unconfined path — it is a property to design
-around, and two things follow from it. `/etc/openbao/tls` is `root:openbao 0750` rather than
+around, and two things follow from it. Everything OpenBao reads is `root:openbao 0750` rather than
 `65532:65532 0700` precisely so a confined root can read the CA without a capability; owning the
-directory by uid also meant OpenBao could rewrite its own private key, which it now cannot. And a Raft
+directory by uid also meant OpenBao could rewrite its own private key, which it now cannot. **That is
+also why TLS could move to the Raft volume**: the mountpoint is root-owned with group read and Raft gets
+`data/` to itself, where a 0700 mountpoint owned by 65532 would have made `/var/lib/openbao/tls`
+untraversable by the very CLI that needs the CA.
+
+The second is that a Raft
 snapshot cannot be written on the node at all, so snapshots are taken through stack's `openbao:tunnel`,
 which is how the command is meant to be used — it is an API client, not a node-local tool. Anything that
 makes an operator reach for `-tls-skip-verify` is a bug in this image, not an operator error.
@@ -108,11 +119,30 @@ file to give; and it would mandate the *weakest* at-rest option, because a stati
 decrypts while Shamir shares never touch the node. `verify-image` asserts the absence across the whole
 directory.
 
+**Omitting `tls_cert_file` turns ACME on; it does not turn TLS off.** OpenBao 2.6.1 enables ACME by
+default when that parameter is empty, pointed at Let's Encrypt production, and its HTTP-01 challenge takes
+a temporary bind on port 80 — measured, the server logs
+`listener-acme.maintenance: started background certificate maintenance` and reports `tls: "enabled"` with
+no certificate configured at all. That is a sensible default for a node on the public internet and the
+wrong one for a node reached over a private address, which cannot complete the challenge and retries
+indefinitely while everything else looks healthy. Since `10-listener.hcl` is a fragment a user is invited
+to replace, this is a trap the image ships toward rather than away from: the fragment's header says so and
+`openbao-selfcheck` reports which of the two is in effect. OpenBao offers HTTP-01 and TLS-ALPN-01 and no
+DNS-01, so there is no challenge type that works without inbound reachability.
+
 **A static seal key with a trailing newline is a fatal error that names neither the file nor the cause.**
 `openssl rand -base64 32 > key` produces one, and OpenBao answers
 `unknown encoding for AES-256 key: must be either a raw, hex, or base64-encoded`. Measured against 2.6.1.
 `start_pre()` refuses to start and says how to fix it; `openbao-selfcheck` checks it too. Do not "fix"
 this by trimming the file — silently rewriting an operator's key material is worse than refusing.
+
+**TLS lives on the attached volume, the seal key does not, and the split is deliberate.**
+`/var/lib/openbao/tls` reattaches with the volume, so replacing a Droplet needs no certificate copied back
+and none reissued — the certificate is about OpenBao's *name*, not the node's address. The seal key stays
+at `/etc/openbao/seal/key` on the boot disk, which is what keeps a snapshot of that volume useless on its
+own: move it across and the ciphertext and its key sit on one disk. Raft moved to `data/` under the mount
+so the mountpoint could be root-owned; `openbao-volume` refuses to start on a pre-2026-08-11 volume rather
+than initializing an empty store beside the old one.
 
 **The audit device does not rotate itself, and a full root filesystem is an outage.** Upstream is
 explicit: the `file` device "does not currently assist with any log rotation", and a `SIGHUP` makes it

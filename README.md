@@ -124,15 +124,34 @@ First boot comes up with OpenBao **not running**, by design: the service refuses
 material is in place. Install it, then start:
 
 ```bash
-# From stack, against the new node's private address
-scripts/generate-openbao-tls <node-private-address>
-scp .openbao/tls/{server.crt,server.key,ca.crt} root@<node>:/etc/openbao/tls/
+# From stack, where `mise run infra:apply` has already issued this material. The certificate is about
+# OpenBao's NAME, not this node's address, which is why it can be issued before the node exists.
+scp .openbao/tls/{server.crt,server.key,ca.crt} root@<node>:/var/lib/openbao/tls/
 ssh root@<node> 'rc-service openbao start'
 ```
+
+**That destination is on the attached volume, which is the point.** A replacement Droplet reattaches the
+volume and the certificate is still there and still valid, so this is once per volume rather than once per
+node. `openbao-volume` creates the directory at boot, so it exists before the first `scp`.
 
 All three files are required — `ca.crt` because the listener names it as `tls_client_ca_file` — and the
 service applies `root:openbao` and the right modes to them itself on every start, so nothing here has to
 get a `chown` right.
+
+The **seal key** deliberately does not live there. If you are using the static seal it goes to
+`/etc/openbao/seal/key` on the boot disk, and it is the one file a replacement node still needs: keeping
+it off the volume is what makes a snapshot of that volume useless without it.
+
+**If your node is publicly reachable, you can skip all of this and let OpenBao get its own certificate.**
+Replace `10-listener.hcl` with one that omits `tls_cert_file` and sets `tls_acme_domains` and
+`tls_acme_email`, and OpenBao requests a publicly-trusted certificate from Let's Encrypt — no `scp`, no
+CA, and no `ca.crt` on any client. Note what that requires, because the failure mode is a retry loop
+rather than an error: OpenBao offers HTTP-01 and TLS-ALPN-01 and **no DNS-01**, so the CA must be able to
+reach the name, and HTTP-01 takes a temporary bind on port 80. A node on a private address cannot use it.
+Transitboard's own deployment cannot, which is why the image ships file-based TLS as the default — but
+that is a property of that deployment, not of this image. `openbao-selfcheck` reports which of the two is
+in effect, and **an empty `tls_cert_file` selects ACME rather than disabling TLS**, so this is opted into
+by editing rather than by deleting.
 
 Every boot after that starts OpenBao on its own — which is a deliberate change from the Debian node,
 whose unit was installed disabled so a reboot could not skip the TLS step. With one node and no quorum,

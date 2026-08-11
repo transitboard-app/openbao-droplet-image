@@ -32,9 +32,10 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
 
   /usr/sbin/bao mr,
 
-  # Configuration, TLS material and the seal key. Read-only: OpenBao has no business rewriting its own
-  # config, and neither the private key nor the seal key should be reachable for writing even by the
-  # process that uses them.
+  # Configuration and the seal key. Read-only: OpenBao has no business rewriting its own config, and the
+  # seal key should be unreachable for writing even by the process that uses it. TLS moved to the attached
+  # volume in 2026-08-11 and is denied writes explicitly below, because the Raft grant would otherwise
+  # cover it.
   /etc/openbao/ r,
   /etc/openbao/** r,
 
@@ -48,6 +49,17 @@ profile openbao /usr/sbin/bao flags=(attach_disconnected) {
   # as a startup failure rather than as a permission error.
   /var/lib/openbao/ rw,
   /var/lib/openbao/** rwk,
+
+  # TLS lives on this volume too, and the grant above would otherwise let OpenBao rewrite its own private
+  # key. DAC already forbids it -- the files are root:openbao 0640 -- but this is the layer that used to
+  # forbid it too, back when TLS was under /etc/openbao and the profile granted only `r` there. Restoring
+  # that is one line.
+  #
+  # **A targeted deny is safe where a blanket one is not**, and the difference is worth stating because
+  # this file warns about exactly that below. `deny /** w` would override the Raft grant above and OpenBao
+  # could not write its own store; `deny` on this subtree overrides a write nothing needs, which is the
+  # whole point of writing it.
+  deny /var/lib/openbao/tls/** w,
 
   # The audit log, on the Droplet's own disk rather than the Raft volume. OpenBao refuses requests when
   # every audit device fails to write, so an audit log that filled the Raft volume would take the

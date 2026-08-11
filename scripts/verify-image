@@ -124,14 +124,27 @@ check "seal dir is 0750"          "[ \"\$(stat -c %a $R/etc/openbao/seal)\" = 75
 check "no seal key shipped"       "! test -e $R/etc/openbao/seal/key"
 check "openbao user is 65532"     "grep -q '^openbao:x:65532:' $R/etc/passwd"
 check "openbao user has nologin"  "grep '^openbao:' $R/etc/passwd | grep -q nologin"
-# root:openbao 0750, not 65532:65532 0700. Owned by the uid OpenBao runs as, the directory holding its
-# own private key was writable by the process using it, and -- because the AppArmor profile attaches to
-# /usr/sbin/bao and grants no capability -- it was unreadable to a confined root, which broke every
-# operator command on the node. Asserted here because both properties are invisible in a diff of the
-# files themselves.
-check "tls dir is root-owned"     "[ \"\$(stat -c %u $R/etc/openbao/tls)\" = 0 ]"
-check "tls dir group is 65532"    "[ \"\$(stat -c %g $R/etc/openbao/tls)\" = 65532 ]"
-check "tls dir is 0750"           "[ \"\$(stat -c %a $R/etc/openbao/tls)\" = 750 ]"
+# **No TLS directory on the boot disk.** It moved to /var/lib/openbao/tls on the attached volume so a
+# replacement Droplet reattaches it rather than an operator copying a key back -- see D23. Leaving the old
+# directory behind would be worse than deleting it: an `scp` to the old path would succeed and the node
+# would still refuse to start, naming a directory that looked correct.
+check "no tls dir on boot disk"   "! test -e $R/etc/openbao/tls"
+check "listener reads the volume" "grep -q '/var/lib/openbao/tls/server.crt' $R/etc/openbao/config.d/10-listener.hcl"
+# tls_cert_file present, asserted as a value rather than assumed from the path check above, because its
+# ABSENCE is not "no TLS" -- OpenBao 2.6.1 reads an empty tls_cert_file as "use ACME", aims at Let's
+# Encrypt production and takes a temporary bind on port 80 for the challenge. Measured. A node reached
+# over a private address can never complete it, so the failure is a retry loop rather than a refusal.
+check "listener sets tls_cert_file" "grep -qE '^[[:space:]]*tls_cert_file[[:space:]]*=' $R/etc/openbao/config.d/10-listener.hcl"
+check "no acme shipped"           "! grep -rqE '^[[:space:]]*tls_acme_' $R/etc/openbao/config.d/"
+check "service gates on the volume" "grep -q '/var/lib/openbao/tls/server.crt' $R/etc/init.d/openbao"
+# root:openbao 0750, not 65532:65532 0700, and this is now the mountpoint rather than a directory under
+# /etc. Owned by the uid OpenBao runs as, it could not be traversed by a confined root -- the AppArmor
+# profile attaches to /usr/sbin/bao and grants no capability -- which broke every operator command on the
+# node and is the reason TLS can live on this volume at all. Raft gets a subdirectory it owns outright.
+check "volume mount is root-owned" "[ \"\$(stat -c %u $R/var/lib/openbao)\" = 0 ]"
+check "volume mount group is 65532" "[ \"\$(stat -c %g $R/var/lib/openbao)\" = 65532 ]"
+check "volume mount is 0750"      "[ \"\$(stat -c %a $R/var/lib/openbao)\" = 750 ]"
+check "storage is a subdirectory" "grep -q 'path = \"/var/lib/openbao/data\"' $R/etc/openbao/config.d/00-storage.hcl"
 
 echo "==> confinement"
 check "apparmor profile present"  "test -f $R/etc/apparmor.d/openbao"

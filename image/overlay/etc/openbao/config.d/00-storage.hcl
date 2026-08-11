@@ -31,10 +31,13 @@
 # Auto-unseal is opted into with a fragment; README.md has the shape and the trade.
 
 storage "raft" {
-  path = "/var/lib/openbao"
+  # A subdirectory of the mount, not the mount itself. The mountpoint is root:openbao 0750 so that TLS can
+  # live beside this and still be readable by a confined `bao` run by root -- see /etc/init.d/openbao-volume
+  # -- and Raft needs a directory it owns outright, which this is: 65532:65532 0700.
+  path = "/var/lib/openbao/data"
 
   # **`node_id` is deliberately absent, which is not the same as unset.** OpenBao generates one on first
-  # use and persists it to `/var/lib/openbao/node-id` -- measured against 2.6.1 -- so it is stable across
+  # use and persists it to `<path>/node-id` -- measured against 2.6.1 -- so it is stable across
   # restarts and, because that file is on the Raft volume, it follows the store rather than the Droplet.
   # A node replaced for an image bump reattaches the volume and keeps its raft identity.
   #
