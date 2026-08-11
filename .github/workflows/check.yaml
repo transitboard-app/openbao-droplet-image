@@ -59,6 +59,24 @@ jobs:
       - name: Install system packages
         run: mise bootstrap packages apply --yes
 
+      # Hardware virtualisation, which this runner has and does not hand over.
+      #
+      # /dev/kvm is present on GitHub-hosted ubuntu-24.04 runners -- an AMD EPYC with svm, kvm modules
+      # loaded, the device node there -- but owned root:kvm and mode 0660, and the runner user is not in
+      # that group. So QEMU silently fell back to TCG and the boot test emulated an x86 machine on x86
+      # hardware. Measured: it was the single largest step in this workflow.
+      #
+      # The udev rule is the standard fix, the same one the Android emulator actions use. Nothing in the
+      # build needs it; only the boot test does, and mise's boot:run reports which accelerator it got so
+      # this cannot regress into "slow for a reason nobody checked".
+      - name: Let QEMU use hardware virtualisation
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
       - name: Load nbd
         run: sudo modprobe nbd max_part=8
 

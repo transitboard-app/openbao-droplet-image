@@ -72,6 +72,24 @@ jobs:
       - name: Install system packages
         run: mise bootstrap packages apply --yes
 
+      # Hardware virtualisation, which this runner has and does not hand over.
+      #
+      # /dev/kvm is present on GitHub-hosted ubuntu-24.04 runners -- an AMD EPYC with svm, kvm modules
+      # loaded, the device node there -- but owned root:kvm and mode 0660, and the runner user is not in
+      # that group. So QEMU silently fell back to TCG and the boot test emulated an x86 machine on x86
+      # hardware. Measured: it was the single largest step in this workflow.
+      #
+      # The udev rule is the standard fix, the same one the Android emulator actions use. Nothing in the
+      # build needs it; only the boot test does, and mise's boot:run reports which accelerator it got so
+      # this cannot regress into "slow for a reason nobody checked".
+      - name: Let QEMU use hardware virtualisation
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
       # `verify` mounts the built image through qemu-nbd, and the module is not loaded on a fresh runner.
       # Loading it here rather than inside the task keeps the task honest about needing a host that can.
       - name: Load nbd
@@ -86,9 +104,9 @@ jobs:
       # The check that catches anything which breaks the boot rather than the contents -- deleting a
       # binary that other names point at, for instance, which offline verification cannot see.
       #
-      # /dev/kvm is not reliably present on GitHub-hosted runners, so this usually runs under TCG and
-      # takes a few minutes. That is worth paying on a manual release; the input exists for when it is
-      # not.
+      # Hardware-accelerated since the step above makes /dev/kvm usable. It used to run under TCG on
+      # the assumption that GitHub runners had no KVM, which was wrong -- the device was there and
+      # unreadable. boot:run prints which accelerator it got.
       - name: Boot test
         if: ${{ inputs.boot_test }}
         run: mise run boot --seconds 300

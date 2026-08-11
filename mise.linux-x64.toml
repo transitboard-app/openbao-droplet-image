@@ -405,6 +405,21 @@ run = """
 log={{ vars.boot_work }}/boot.log
 : > "$log"
 
+# Which accelerator this boot actually used, reported rather than assumed.
+#
+# No -accel flag is passed below, deliberately: qemu-system-x86_64 defaults to trying KVM and falling
+# back to TCG, which is exactly the behaviour wanted -- hardware where there is hardware, emulation
+# where there is not, and no host-specific flag in the task. What was missing was any way to tell which
+# happened, and the difference is large enough to change what a timing means. A boot test that takes
+# four times as long because /dev/kvm was not readable looks identical to one that is genuinely slow.
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+	echo "accelerator: kvm (hardware)"
+else
+	echo "accelerator: tcg (emulated) -- /dev/kvm is not usable by $(id -un)"
+	echo "  on a GitHub runner the device exists and is root-only; the Check workflow makes it"
+	echo "  world-accessible with a udev rule. Locally, add yourself to the kvm group."
+fi
+
 # Three things beyond a plain boot, each of which a service now hard-depends on:
 #
 #   two NICs    because the image configures eth0 and eth1 and DigitalOcean serves DHCP on both. One NIC

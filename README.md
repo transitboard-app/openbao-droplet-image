@@ -44,6 +44,26 @@ orb run -m build-x64 sudo modprobe ext4   # OrbStack ships ext4 unloaded; not ne
 Build from a path on the machine's own filesystem rather than the shared `/mnt/mac` mount — loop devices
 and chroots do not work over virtiofs.
 
+### `mise run boot` is emulated on a Mac, and that is not fixable
+
+`boot` passes no `-accel`, so QEMU tries KVM and falls back to TCG, and prints which it got. On Apple
+Silicon it will always say TCG, and no amount of configuration changes that:
+
+- **Rosetta cannot help.** It translates x86-64 *user-space* binaries inside an ARM Linux VM. This
+  artifact is a disk image with an x86-64 *kernel*, and a translator that works one process at a time
+  has nothing to say about `vmlinuz`. The same goes for `binfmt_misc` and `qemu-user`.
+- **`-accel hvf` is same-architecture only.** Apple's hypervisor virtualises ARM on ARM. There is no
+  x86-64 hardware on the machine to virtualise, so an x86 guest must be emulated instruction by
+  instruction.
+
+So a boot timed on an Apple Silicon Mac is roughly an order of magnitude off, and only useful for
+*comparing* two builds on the same host. For a wall-clock number that means something, use CI — the
+`Check` workflow makes `/dev/kvm` usable and the boot test runs hardware-accelerated there — or boot the
+published image on an actual Droplet.
+
+On an x86-64 Linux host, `boot` uses KVM automatically as long as you can read `/dev/kvm`
+(`sudo usermod -aG kvm "$USER"`, then log in again).
+
 ## Tasks
 
 | Task | Platform | Does |

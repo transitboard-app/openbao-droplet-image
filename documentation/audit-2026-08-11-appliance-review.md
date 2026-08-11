@@ -190,8 +190,15 @@ gap — changed nothing measurable, because `mdev` does the work either way; and
 worth removing: `swap` is a no-op on an image with no swap, and every other service has a caller.
 
 The honest conclusion is that the boot is not obviously slow. What makes it *look* slow is where it is
-usually watched: CI's boot test runs under TCG because GitHub-hosted runners do not expose `/dev/kvm`,
-and takes 67 seconds of a two-minute pipeline. A Droplet has hardware virtualisation and does not.
+usually watched, and that turned out to be a fixable mistake rather than a fact.
+
+**GitHub-hosted runners do have KVM.** The first version of this section said they did not, on the
+strength of a comment in `release.yaml` that had been carried for months. Probed instead: an
+`ubuntu-24.04` runner is an AMD EPYC 9V74 with `svm`, the `kvm` modules loaded and `/dev/kvm` present --
+owned `root:kvm`, mode 0660, and the runner user is not in that group. So QEMU fell back to TCG and the
+boot test emulated an x86 machine on x86 hardware, silently, because nothing reported which accelerator
+was in use. A one-line udev rule fixes it, and `boot:run` now prints the answer so it cannot regress
+into "slow for a reason nobody checked".
 
 ## Readiness
 
