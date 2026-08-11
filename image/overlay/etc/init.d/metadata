@@ -1,0 +1,81 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # openrc-run reads these variables out of this file; nothing here uses
+# them directly, so shellcheck cannot see the consumer.
+# Reads this node's identity from the cloud metadata service, once, and caches it for everything else.
+#
+# This service exists because a dependency cannot be declared on it. `need net` means an interface is
+# configured; it cannot mean "the hypervisor is answering HTTP on 169.254.169.254", because that endpoint
+# is not a service on this machine and OpenRC has no handle on it. DHCP completing and the metadata
+# service answering are not the same instant, so something has to wait -- and the only question is how
+# many places do the waiting.
+#
+# It used to be two. `cloud-ssh-keys` retried fifteen times and said why; `openbao` made a single attempt
+# and lost the race on a boot where everything else came up correctly, ending with a node that answered
+# on port 22 and had no secret store. That divergence is what duplicated logic produces. Now the wait
+# happens once, here, and both consumers declare `need metadata` and read files.
+#
+# The cache is /run, which is tmpfs: it is rebuilt every boot and never outlives one.
+
+description="Read this node's identity from the cloud metadata service"
+
+: "${IMDS_URL:=http://169.254.169.254/metadata/v1}"
+: "${IMDS_ATTEMPTS:=15}"
+: "${IMDS_TIMEOUT:=3}"
+
+cache=/run/metadata
+
+depend() {
+	need net
+	before openbao cloud-ssh-keys
+	provide metadata
+}
+
+fetch() {
+	wget -qO- -T "$IMDS_TIMEOUT" "$IMDS_URL/$1" 2>/dev/null || true
+}
+
+start() {
+	# Waited on with `id`, not with the private address, and the difference is a node's reachability.
+	# `id` is present for every Droplet; the private address is absent on one created without VPC
+	# networking. Gating this service on the address would make it fail on such a node and take
+	# cloud-ssh-keys down with it -- turning a Droplet that merely cannot run OpenBao into one nobody can
+	# log in to. So this waits for the service to answer, and each field is fetched on its own merits.
+	ebegin "Waiting for the metadata service at $IMDS_URL"
+	answer=""
+	attempt=0
+	while [ "$attempt" -lt "$IMDS_ATTEMPTS" ]; do
+		answer="$(fetch id)"
+		[ -n "$answer" ] && break
+		attempt=$((attempt + 1))
+		sleep 2
+	done
+	if [ -z "$answer" ]; then
+		eend 1 "No answer after $IMDS_ATTEMPTS attempts; this node cannot identify itself"
+		return 1
+	fi
+	eend 0
+
+	# 0700 before anything is written rather than a chmod after it: user-data is operator-supplied and
+	# public-keys decides who can log in, so neither is briefly readable by anything else.
+	install -d -o root -g root -m 0700 "$cache"
+	umask 077
+
+	fetch interfaces/private/0/ipv4/address > "$cache/private-address"
+	fetch public-keys > "$cache/public-keys"
+	fetch user-data > "$cache/user-data"
+
+	# Reported rather than assumed. A node with no private address still starts this service; it is
+	# openbao that refuses, and it says so in its own words.
+	address="$(cat "$cache/private-address" 2>/dev/null)"
+	if [ -n "$address" ]; then
+		einfo "Droplet $answer, private address $address"
+	else
+		ewarn "Droplet $answer has no private address; OpenBao cannot advertise one"
+	fi
+}
+
+stop() {
+	rm -rf "$cache"
+	return 0
+}

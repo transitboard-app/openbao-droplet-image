@@ -29,7 +29,12 @@ check "qcow2 format" "qemu-img info '$IMAGE' | grep -q 'file format: qcow2'"
 modprobe nbd max_part=8 2>/dev/null || true
 nbd=/dev/nbd0
 qemu-nbd --connect="$nbd" --format=qcow2 "$IMAGE"
-trap 'umount /mnt/img 2>/dev/null || true; losetup -D 2>/dev/null || true; qemu-nbd --disconnect "$nbd" >/dev/null 2>&1 || true' EXIT
+# `losetup -d "$loop"`, never `losetup -D`. The second is "detach all", not "detach mine", and this
+# script runs as root on a CI runner and on developer machines -- it would reach loop devices it did not
+# create and has no business touching. $loop is empty until it is set below, and `losetup -d` with no
+# argument is a usage error rather than a wildcard, so the trap is safe from the moment it is installed.
+loop=""
+trap 'umount /mnt/img 2>/dev/null || true; if [ -n "$loop" ]; then losetup -d "$loop" 2>/dev/null || true; fi; qemu-nbd --disconnect "$nbd" >/dev/null 2>&1 || true' EXIT
 sleep 2
 
 # DigitalOcean rejects an image with no partition table, and alpine-make-vm-image writes the filesystem
@@ -69,6 +74,14 @@ check "serial console on cmdline" "grep -qE 'console=ttyS0' $R/boot/extlinux.con
 check "kernel present"            "ls $R/boot/vmlinuz-virt"
 check "initramfs present"         "ls $R/boot/initramfs-virt"
 check "memory zeroing enabled"    "grep -q 'init_on_free=1' $R/boot/extlinux.conf"
+# Both boot-tested before being enabled, and both silently absent if the command-line edit above ever
+# drops them -- the same failure mode as apparmor=1, which is why they are asserted the same way.
+check "kernel lockdown enabled"   "grep -q 'lockdown=integrity' $R/boot/extlinux.conf"
+check "module signatures forced"  "grep -q 'module.sig_enforce=1' $R/boot/extlinux.conf"
+# Pure description of the machine, useful only to somebody standing on it: the kernel's build
+# configuration and the pre-hardening boot configuration.
+check "no kernel config"          "! ls $R/boot/config-* 2>/dev/null | grep -q ."
+check "no previous extlinux conf" "! test -e $R/boot/extlinux.conf.old"
 
 echo "==> OpenBao"
 check "binary installed"          "test -x $R/usr/sbin/bao"
@@ -81,6 +94,14 @@ check "disable_mlock absent"      "! grep -qE '^[^#]*disable_mlock' $R/etc/openb
 check "audit device declared"     "grep -q 'audit \"file\"' $R/etc/openbao/openbao.hcl"
 check "openbao user is 65532"     "grep -q '^openbao:x:65532:' $R/etc/passwd"
 check "openbao user has nologin"  "grep '^openbao:' $R/etc/passwd | grep -q nologin"
+# root:openbao 0750, not 65532:65532 0700. Owned by the uid OpenBao runs as, the directory holding its
+# own private key was writable by the process using it, and -- because the AppArmor profile attaches to
+# /usr/sbin/bao and grants no capability -- it was unreadable to a confined root, which broke every
+# operator command on the node. Asserted here because both properties are invisible in a diff of the
+# files themselves.
+check "tls dir is root-owned"     "[ \"\$(stat -c %u $R/etc/openbao/tls)\" = 0 ]"
+check "tls dir group is 65532"    "[ \"\$(stat -c %g $R/etc/openbao/tls)\" = 65532 ]"
+check "tls dir is 0750"           "[ \"\$(stat -c %a $R/etc/openbao/tls)\" = 750 ]"
 
 echo "==> confinement"
 check "apparmor profile present"  "test -f $R/etc/apparmor.d/openbao"
@@ -98,10 +119,24 @@ check "no ambient capabilities"   "! grep -qE '^[^#]*capabilities=' $R/etc/init.
 # directory empty -- so the documented glob matched nothing on a Droplet whose volume was attached and
 # healthy, and OpenBao refused to start. Asserted here because the correct version is the less obvious
 # one and reads like a mistake.
-check "volume found via sysfs"    "grep -q '/sys/block/sd\\*' $R/etc/init.d/openbao"
+# The service must survive its own crashes. Alpine's inherited default gives up after five in thirty
+# minutes, which on a single node with no quorum is the store gone until somebody notices.
+check "openbao respawns forever"  "grep -q '^respawn_max=0' $R/etc/init.d/openbao"
+# The metadata service answers some time after the network is up, and that wait cannot be an OpenRC
+# dependency because the endpoint is not a service on this machine. It is owned by one service that
+# everything else declares `need` on, rather than by a retry loop per consumer -- which is how openbao
+# ended up with no retry at all while cloud-ssh-keys had fifteen.
+check "one place retries IMDS"    "grep -q 'IMDS_ATTEMPTS' $R/etc/init.d/metadata"
+check "openbao needs metadata"    "grep -qE '^[[:space:]]*need .*metadata' $R/etc/init.d/openbao"
+check "openbao needs its volume"  "grep -qE '^[[:space:]]*need .*openbao-volume' $R/etc/init.d/openbao"
+check "ssh keys need metadata"    "grep -qE '^[[:space:]]*need metadata' $R/etc/init.d/cloud-ssh-keys"
+# No consumer fetches for itself. A second copy of the retry logic is how the two diverged.
+check "no IMDS fetch in openbao"  "! grep -q '169.254.169.254' $R/etc/init.d/openbao"
+check "no IMDS fetch in ssh keys" "! grep -q '169.254.169.254' $R/etc/init.d/cloud-ssh-keys"
+check "volume found via sysfs"    "grep -q '/sys/block/sd\\*' $R/etc/init.d/openbao-volume"
 # Anchored past any `#`, because the comment above that code names the by-id path in order to explain
 # why it is not used -- and the first version of this check failed on that comment.
-check "no by-id volume glob"      "! grep -qE '^[^#]*disk/by-id' $R/etc/init.d/openbao"
+check "no by-id volume glob"      "! grep -qE '^[^#]*disk/by-id' $R/etc/init.d/openbao-volume"
 
 echo "==> attack surface"
 # Measured rather than asserted: these are the numbers that justify the appliance over a Debian node,
@@ -122,6 +157,10 @@ check "no interpreters"           "! ls $R/usr/bin/python3* $R/usr/bin/perl 2>/d
 # from this check: apparmor_parser links it.
 check "no orphaned sqlite"        "! ls $R/usr/lib/libsqlite3.so* 2>/dev/null | grep -q ."
 check "no orphaned mpdec"         "! ls $R/usr/lib/libmpdec* 2>/dev/null | grep -q ."
+# A tool for granting file capabilities and a tool for manipulating capability sets, on a machine whose
+# premise is that nothing holds a capability. They arrived with libcap-utils, which was justified by a
+# self-check that no longer uses it.
+check "no capability tools"       "! ls $R/usr/sbin/setcap $R/usr/sbin/capsh $R/usr/sbin/getpcaps 2>/dev/null | grep -q ."
 # Symbols on a host holding unsealed key material help an attacker more than an operator.
 check "bao is stripped"           "! readelf -S $R/usr/sbin/bao 2>/dev/null | grep -q '\.symtab'"
 check "binary provenance kept"    "test -s $R/etc/openbao-binary-provenance"
@@ -151,6 +190,18 @@ check "net deps are not strict"   "grep -q '^rc_depend_strict=\"NO\"' $R/etc/rc.
 # PAM-less sshd refuses a locked account before it reads authorized_keys.
 check "root has no password"      "grep -q '^root:\\*:' $R/etc/shadow"
 check "root is NOT locked"        "! grep -q '^root:!' $R/etc/shadow"
+# The artifacts of the `debug` build that used to exist here, kept as assertions after the build path
+# itself was removed. They no longer guard against releasing the wrong file -- there is no longer a way
+# to produce one -- they guard against somebody adding the capability back.
+check "no debug marker"           "! test -e $R/etc/APPLIANCE-DEBUG"
+check "no debug sshd config"      "! test -e $R/etc/ssh/sshd_config.d/00-debug.conf"
+check "no password auth drop-in"  "! grep -rqi '^[[:space:]]*PasswordAuthentication[[:space:]]*yes' $R/etc/ssh/"
+# No getty on any virtual terminal: no password can match, so the prompt exists only to be failed at.
+check "no virtual terminal getty" "! grep -q '^tty[1-6]:' $R/etc/inittab"
+check "serial console getty kept" "grep -q '^ttyS0:' $R/etc/inittab"
+# Every Droplet from an image carrying a baked host key would present the same key as every other, and
+# nothing anywhere would say so. Confirmed absent, and confirmed regenerated at first boot.
+check "no baked ssh host keys"    "! ls $R/etc/ssh/ssh_host_* 2>/dev/null | grep -q ."
 
 # Dangling symlinks in /bin and /sbin, which is the failure mode of removing a binary that other names
 # point at. `mount` is the one that matters -- OpenRC cannot mount /run without it and gives up before
@@ -179,6 +230,16 @@ check "virtio_scsi kept"          "ls $R/lib/modules/*/kernel/drivers/scsi/virti
 check "virtio_blk kept"           "ls $R/lib/modules/*/kernel/drivers/block/virtio_blk.ko* >/dev/null 2>&1"
 check "virtio_net kept"           "ls $R/lib/modules/*/kernel/drivers/net/virtio_net.ko* >/dev/null 2>&1"
 check "no netfilter"              "! test -d $R/lib/modules/*/kernel/net/netfilter"
+# Protocol families the kernel autoloads on a socket() call, which is four lines of C needing no
+# privilege. A module that is not on disk cannot be autoloaded by anything.
+check "no autoloadable families"  "! ls -d $R/lib/modules/*/kernel/net/key $R/lib/modules/*/kernel/net/llc $R/lib/modules/*/kernel/net/vmw_vsock $R/lib/modules/*/kernel/net/l2tp 2>/dev/null | grep -q ."
+# The NVMe-over-TCP target is a network-facing block protocol server; it arrived with the deliberate
+# decision to keep nvme/host for DigitalOcean's storage.
+check "nvme host kept"            "test -d $R/lib/modules/*/kernel/drivers/nvme/host"
+check "no nvme target"            "! test -d $R/lib/modules/*/kernel/drivers/nvme/target"
+# 1.4 MiB of hypervisor that loaded itself into the secret store host, observed in lsmod on the running
+# appliance.
+check "no kvm"                    "! test -d $R/lib/modules/*/kernel/arch/x86/kvm"
 
 echo "==> services"
 # `test -L`, not `ls`. Runlevel entries are symlinks to absolute paths (/etc/init.d/openbao), so they
@@ -188,9 +249,25 @@ echo "==> services"
 for s in apparmor tiny-cloud-boot; do
 	check "$s enabled at boot"    "test -L $R/etc/runlevels/boot/$s"
 done
-for s in openbao sshd chronyd tiny-cloud-main openbao-pod-routes cloud-ssh-keys; do
+# sysctl is in this list because all twenty settings in 99-openbao.conf depend on it and it is enabled
+# only because Alpine puts it there -- an unguarded property held by somebody else's default.
+check "sysctl enabled at boot"    "test -L $R/etc/runlevels/boot/sysctl"
+for s in openbao openbao-volume metadata sshd chronyd tiny-cloud-main openbao-pod-routes cloud-ssh-keys openbao-selfcheck; do
 	check "$s enabled by default" "test -L $R/etc/runlevels/default/$s"
 done
+
+echo "==> logs"
+# The appliance must not be able to fill its own root disk. OpenBao refuses requests when every audit
+# device fails to write, and the audit device does not rotate itself -- 5.8 KiB per operation, measured,
+# against a 25 GiB Droplet.
+check "crond enabled by default"  "test -L $R/etc/runlevels/default/crond"
+check "log rotator installed"     "test -x $R/usr/local/sbin/openbao-rotate-logs"
+# test -L, not -e: this is a symlink to an absolute path, so it resolves against the HOST while the image
+# is mounted here and would read as missing on an image where it is correct.
+check "log rotator scheduled"     "test -L $R/etc/periodic/15min/openbao-rotate-logs"
+check "cron runs the 15min set"   "grep -q 'periodic/15min' $R/etc/crontabs/root"
+# Upstream's protocol for rotating an audit log the file device will not rotate itself.
+check "openbao reload defined"    "grep -q 'extra_started_commands=\"reload\"' $R/etc/init.d/openbao"
 
 echo "==> ssh"
 # Turning this off is the most plausible well-intentioned change that would break operations entirely,

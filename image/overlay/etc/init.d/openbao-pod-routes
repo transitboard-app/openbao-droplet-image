@@ -29,11 +29,19 @@ start() {
 		return 0
 	}
 	ebegin "Installing pod routes"
+	# The failure is recorded and the loop finishes, rather than returning from inside it. Returning
+	# there skipped the matching eend and left the ebegin above dangling, so a bad route line produced an
+	# unterminated progress line and no verdict -- and it also stopped at the first bad line, hiding
+	# every other route from the operator who has to fix the file.
+	failed=0
 	while read -r cidr next_hop; do
 		case "$cidr" in ''|\#*) continue ;; esac
 		# `replace` rather than `add`, so re-running is not an error. busybox's ip applet does not
 		# implement replace, which is why iproute2 is in the package list.
-		ip route replace "$cidr" via "$next_hop" || return 1
+		if ! ip route replace "$cidr" via "$next_hop"; then
+			eerror "Could not install $cidr via $next_hop"
+			failed=1
+		fi
 	done < /etc/openbao/pod-routes
-	eend $?
+	eend "$failed" "Some pod routes were not installed; pods on those nodes cannot reach OpenBao"
 }

@@ -1,0 +1,83 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # openrc-run reads these variables out of this file; nothing here uses
+# them directly, so shellcheck cannot see the consumer.
+# Mounts the DigitalOcean block volume that holds the Raft store.
+#
+# Mounted here rather than from fstab, and the reasoning is worth restating because getting it wrong is
+# silent and destroys the store: the volume is attached by a separate API call that cannot run until the
+# Droplet exists, so at first boot the device is genuinely absent. Mounting from fstab at boot fails, and
+# NOT mounting at all is worse -- OpenBao then writes its Raft store to the Droplet's own disk while the
+# attached volume sits empty and nothing says so. This is the trap the systemd unit on the Debian node
+# solved with noauto plus RequiresMountsFor.
+#
+# A service of its own rather than part of openbao's start_pre, so a failure here is attributed here
+# rather than reported as OpenBao failing to start, and so the mount survives an openbao restart.
+# `openbao` declares `need openbao-volume`, which is what makes the ordering real.
+
+description="Mount the DigitalOcean volume holding the OpenBao Raft store"
+
+depend() {
+	need localmount
+	before openbao
+}
+
+start() {
+	if mountpoint -q /var/lib/openbao; then
+		einfo "Raft volume already mounted"
+		return 0
+	fi
+
+	device="${RAFT_DEVICE:-}"
+	if [ -z "$device" ]; then
+		# Ask the kernel what is attached, rather than asking udev.
+		#
+		# DigitalOcean documents the volume as /dev/disk/by-id/scsi-0DO_Volume_<name>, and that path is
+		# real -- on their Debian and Ubuntu images, where udev creates it. This image runs mdev, which
+		# builds /dev/disk/by-label, by-uuid and by-partlabel out of blkid and leaves /dev/disk/by-id
+		# EMPTY. Globbing it therefore matched nothing on a Droplet whose volume was attached and
+		# perfectly healthy. Neither of the directories mdev does populate helps: a DigitalOcean volume
+		# carries no filesystem label, and its UUID is made at create time, so an image built long
+		# beforehand cannot know it.
+		#
+		# sysfs has what is actually needed. A DigitalOcean block volume presents as SCSI vendor "DO",
+		# model "Volume"; the Droplet's own disk is virtio and appears as vda, so it is not a candidate
+		# and cannot be selected by accident.
+		#
+		# One volume per node, so exactly one match is the expected case. Zero or several is a situation
+		# for an operator, not for a guess about which disk holds the secrets.
+		set --
+		for sys in /sys/block/sd*; do
+			[ -e "$sys/device/vendor" ] || continue
+			read -r vendor < "$sys/device/vendor"
+			read -r model < "$sys/device/model"
+			case "$vendor" in DO) ;; *) continue ;; esac
+			case "$model" in Volume) ;; *) continue ;; esac
+			set -- "$@" "/dev/${sys##*/}"
+		done
+		if [ "$#" -eq 1 ] && [ -b "$1" ]; then
+			device="$1"
+		else
+			eerror "Expected exactly one DigitalOcean volume, found $#."
+			eerror "Set RAFT_DEVICE in /etc/conf.d/openbao-volume to choose explicitly."
+			return 1
+		fi
+	fi
+
+	ebegin "Mounting Raft volume $device"
+	mount -t ext4 -o defaults,noatime "$device" /var/lib/openbao
+	eend $? "Could not mount the Raft volume; OpenBao must not start on the Droplet's own disk" || return 1
+
+	# Applied after the mount, not before: it has to land on the mounted filesystem rather than on the
+	# empty directory underneath it. Idempotent, so this is safe on every start.
+	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao
+}
+
+stop() {
+	# Deliberately does not unmount. `openbao` declares `need openbao-volume`, so OpenRC stops the server
+	# before reaching this -- but an unmount that fails because something still holds the store open
+	# leaves this service failed and the mount in place, which is a worse state to reason about than the
+	# mount simply persisting. Shutdown tears down the filesystem itself, and ext4's journal covers the
+	# rest.
+	return 0
+}

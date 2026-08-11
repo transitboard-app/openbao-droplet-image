@@ -9,16 +9,19 @@
 # set_ssh_keys writes nothing at all when CLOUD_USER is unset -- which is how it ships -- and when it
 # does fail it logs "no ssh key found" and lets the boot continue to a login prompt nobody can use.
 #
-# So this does the one job directly, retries rather than giving up on a slow network, and treats failure
-# as a failure. It is idempotent and additive: an operator key added by hand is never removed.
+# So this does the one job directly, and treats failure as a failure. It is idempotent and additive: an
+# operator key added by hand is never removed.
+#
+# There is no network code here and no retry loop. Both moved to /etc/init.d/metadata, which is the one
+# place that waits for the metadata service and caches what it returns -- see that file for why the wait
+# cannot be expressed as an OpenRC dependency, and for what having two copies of it cost.
 
 description="Install SSH keys from the cloud metadata service"
 
-: "${IMDS_URL:=http://169.254.169.254/metadata/v1}"
-: "${KEY_ATTEMPTS:=15}"
+cache=/run/metadata
 
 depend() {
-	need net
+	need metadata
 	before sshd
 	after tiny-cloud-main
 }
@@ -27,25 +30,18 @@ start() {
 	keys_dir=/root/.ssh
 	keys_file="$keys_dir/authorized_keys"
 
-	# Retried, because "the network is up" and "the metadata service answers" are not the same instant.
-	# The working Debian node reaches this address through the ordinary default gateway, so no
-	# link-local route is needed -- if this never succeeds, the node has no usable default route.
-	ebegin "Fetching SSH keys from $IMDS_URL"
-	keys=""
-	attempt=0
-	while [ "$attempt" -lt "$KEY_ATTEMPTS" ]; do
-		keys="$(wget -qO- -T 3 "$IMDS_URL/public-keys" 2>/dev/null || true)"
-		[ -n "$keys" ] && break
-		attempt=$((attempt + 1))
-		sleep 2
-	done
+	ebegin "Installing SSH keys for root"
+	keys="$(cat "$cache/public-keys" 2>/dev/null || true)"
 
-	# The fallback that makes a node recoverable when the metadata service is unreachable at first boot.
-	# DigitalOcean serves user-data from the same place, so this is a second read rather than a second
-	# mechanism -- but an operator can also paste keys into user-data when IMDS itself is the problem.
+	# The fallback that makes a node recoverable when DigitalOcean has no keys registered for it. Both
+	# documents come from the same service, so this is a second field rather than a second mechanism --
+	# but an operator can paste a key into user-data when the Droplet was created without one.
 	if [ -z "$keys" ]; then
-		ewarn "No keys from public-keys after $KEY_ATTEMPTS attempts; trying user-data"
-		keys="$(wget -qO- -T 3 "$IMDS_URL/user-data" 2>/dev/null | grep -E '^(ssh-|ecdsa-)' || true)"
+		ewarn "No keys under public-keys; trying user-data"
+		# sk- covers the FIDO key types, sk-ssh-ed25519@openssh.com and sk-ecdsa-sha2-nistp256@openssh.com.
+		# Without them this fallback silently matched nothing for an operator using a hardware key, on the
+		# exact path that exists because the node is otherwise unreachable.
+		keys="$(grep -E '^(ssh-|ecdsa-|sk-ssh-|sk-ecdsa-)' "$cache/user-data" 2>/dev/null || true)"
 	fi
 
 	if [ -z "$keys" ]; then

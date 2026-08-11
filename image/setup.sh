@@ -29,7 +29,29 @@ install -m 0644 -o root -g root /mnt/provenance /etc/openbao-binary-provenance
 # above.
 
 install -d -o root -g root -m 0755 /etc/openbao
-install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /etc/openbao/tls
+# root:openbao 0750, NOT 65532:65532 0700, and the difference is every operator command on the node.
+#
+# An AppArmor profile attaches to a path, so `profile openbao /usr/sbin/bao` confines the CLI an operator
+# runs by hand exactly as it confines the server -- and the profile grants no capability of any kind.
+# With the directory owned by 65532 and mode 0700, root needed CAP_DAC_READ_SEARCH merely to traverse it
+# and did not have it, so `bao status` failed to read its own CA:
+#
+#   failed to read environment: Error loading CA File: open /etc/openbao/tls/ca.crt: permission denied
+#   apparmor="DENIED" operation="capable" comm="bao" capname="dac_read_search"
+#
+# That broke `bao status`, `operator init`, `operator unseal`, `kv` and the whole first-boot procedure in
+# README.md, and the workaround it invites -- `-tls-skip-verify` -- turns off certificate verification on
+# the host holding every production credential.
+#
+# Giving the directory to root and letting the openbao group read it fixes that with no profile change:
+# the server reads its key through the group, root traverses as owner, and neither needs a capability.
+#
+# It is also the stronger arrangement independently. Under the old ownership the uid OpenBao runs as owned
+# the directory holding its own private key, so an AppArmor failure open -- the failure mode this image is
+# most careful about -- left the process able to rewrite its own TLS material. It no longer can, whatever
+# AppArmor is doing. /etc/init.d/openbao applies the same ownership to the files themselves on every
+# start, so an operator's `scp` cannot get it wrong.
+install -d -o root -g "$BAO_GID" -m 0750 /etc/openbao/tls
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /var/lib/openbao
 install -d -o "$BAO_UID" -g "$BAO_GID" -m 0700 /var/log/openbao
 
@@ -47,10 +69,28 @@ echo "==> kernel command line"
 # particular: they zero pages on allocation and free, which is exactly what you want on a machine whose
 # heap holds unsealed key material.
 #
-# Not enabled yet, deliberately, because each can prevent boot and this image is not yet proven to boot
-# at all: lockdown=integrity, mitigations=auto,nosmt. Add them one at a time, with a boot test each.
+# module.sig_enforce=1 makes the kernel refuse an unsigned module. Boot-tested on its own:
+# /sys/module/module/parameters/sig_enforce reads Y, Alpine's own signed modules load normally, and a
+# tampered one is rejected with `insmod: ERROR: could not insert module: Key was rejected by service`.
+# The kernel already sets CONFIG_MODULE_SIG_ALL=y and carries Alpine's key, so nothing else was needed.
+# This is what turns the module removal below from a measure against autoloading into a measure against
+# an attacker who already has root.
+#
+# lockdown=integrity closes the kernel-modification interfaces root would otherwise keep -- /dev/mem,
+# kexec, unsigned modules, BPF writes to kernel memory. Boot-tested on its own:
+# /sys/kernel/security/lockdown reads `none [integrity] confidentiality`, OpenBao unsealed and served a
+# KV read under it, and openbao-selfcheck came back fully green. `lockdown` was already in the lsm= list;
+# only the mode was missing.
+#
+# Still not enabled, and still for the stated reason -- it can prevent boot and has not been tested here:
+# mitigations=auto,nosmt. Add it on its own, with a boot test.
+#
+# Worth knowing next to randomize_kstack_offset, and not fixable here: `bao` is a non-PIE ELF EXEC, so
+# its own text is not subject to ASLR. That is upstream's build choice; the kernel options below do not
+# reach it.
 lsm_list="landlock,lockdown,yama,loadpin,safesetid,integrity,apparmor"
 hardening="slab_nomerge init_on_alloc=1 init_on_free=1 randomize_kstack_offset=on vsyscall=none debugfs=off"
+hardening="$hardening lockdown=integrity module.sig_enforce=1"
 
 # APPENDED to what is already there, not written over it. alpine-make-vm-image's --serial-console puts
 # `console=ttyS0,115200` in these options, and an earlier version of this line replaced the whole value
@@ -142,10 +182,40 @@ rc-update add tiny-cloud-early default
 rc-update add tiny-cloud-main default
 rc-update add tiny-cloud-final default
 rc-update add chronyd default   # client-only; see /etc/chrony/conf.d/10-appliance.conf
+# busybox's crond, enabled for exactly one job: bounding the log files.
+#
+# A scheduler on an appliance is a cost, and it is paid here because the alternative is worse. OpenBao's
+# file audit device does not rotate -- upstream says so and says to use an external tool and a SIGHUP --
+# and OpenBao refuses requests when every audit device fails to write. At the 5.8 KiB per operation this
+# image measures, an unrotated audit log fills a 25 GiB Droplet and takes the secret store down with it.
+#
+# No package was added for this: crond is busybox, already present, and /etc/crontabs/root already runs
+# /etc/periodic/* -- so what is new is a runlevel entry and one script, not a dependency. `logrotate`
+# would have been the conventional answer and was rejected: it is a config-parsing C program running as
+# root, on an image with no package manager to update it when a CVE lands, to bound one file pattern --
+# and enabling it would also make live the three inert /etc/logrotate.d/ files that arrived with other
+# packages.
+rc-update add crond default
+ln -sf /usr/local/sbin/openbao-rotate-logs /etc/periodic/15min/openbao-rotate-logs
+test -x /usr/local/sbin/openbao-rotate-logs || {
+	echo "FATAL: the log rotator is not executable; the node could fill its own root disk" >&2
+	exit 1
+}
+grep -q 'periodic/15min' /etc/crontabs/root || {
+	echo "FATAL: /etc/crontabs/root does not run /etc/periodic/15min; nothing would rotate the logs" >&2
+	exit 1
+}
 # Before sshd, and not trusting tiny-cloud to have done it. See the service for why.
 rc-update add cloud-ssh-keys default
 rc-update add sshd default
 rc-update add openbao-pod-routes default
+# The one place that waits for the metadata service and caches what it returns. Everything that needs
+# this node's identity declares `need metadata` and reads files, so there is exactly one retry loop on
+# the image rather than one per consumer -- see the service for why the wait cannot be a dependency.
+rc-update add metadata default
+# Split out of openbao's start_pre so a volume that will not mount is reported as a volume that will not
+# mount. openbao declares `need openbao-volume`, so it cannot start on the Droplet's own disk by accident.
+rc-update add openbao-volume default
 
 # OpenBao IS enabled, unlike the systemd unit in stack's cloud-init, which is installed disabled so the
 # operator's TLS step cannot be skipped by a reboot. That reasoning is inverted here on purpose: the
@@ -154,6 +224,10 @@ rc-update add openbao-pod-routes default
 # reboot is a worse failure than one that starts too eagerly, and with one node and no quorum that
 # reboot is the whole availability story.
 rc-update add openbao default
+# Last, and the reason it is a service at all: openbao-selfcheck is what turns this image's claims into
+# facts, and it used to run only when a human typed it. Its output goes to the serial console, which is
+# what DigitalOcean's recovery console shows.
+rc-update add openbao-selfcheck default
 
 echo "==> cloud user"
 # WITHOUT THIS THE NODE IS UNREACHABLE, and nothing says so.
@@ -194,33 +268,21 @@ grep -q '^root:\*:' /etc/shadow || {
 	exit 1
 }
 
-# A DEBUG BUILD, and never a released one.
+# THERE IS NO DEBUG BUILD, and this note is here so nobody adds one back.
 #
-# When the stage directory carries a debug-password file, this unlocks root and turns on password
-# authentication so the DigitalOcean console and plain ssh both work. It exists because this image can
-# boot unreachable, and a node nobody can log into cannot be diagnosed -- which has now cost five
-# rounds of inference from outside the machine.
+# A `mise run debug` task used to bake a root password and a `PasswordAuthentication yes` drop-in into a
+# separately named image, because this appliance can boot unreachable and a node nobody can log into
+# cannot be diagnosed. It was removed: a build path whose entire purpose is to defeat this image's
+# authentication is a permanent invitation, and the two things that justified it are both gone.
 #
-# scripts/verify-image asserts the opposite of everything here ("root password locked", "password auth
-# disabled"), so a debug image cannot pass verification and therefore cannot be released by the
-# workflow. The marker file is a second, human-readable tripwire.
-if [ -f /mnt/debug-password ]; then
-	echo "    *** DEBUG BUILD: password authentication enabled ***"
-	printf 'root:%s' "$(cat /mnt/debug-password)" | chpasswd
-	# 00-, not 99-: sshd takes the FIRST obtained value for each keyword, and the include glob is read in
-	# lexical order, so 10-appliance.conf's `PasswordAuthentication no` wins against anything sorting
-	# after it. A 99- prefix produced an sshd that ignored every line in this file.
-	cat > /etc/ssh/sshd_config.d/00-debug.conf <<-'DEBUG'
-	# DEBUG BUILD ONLY. Must sort before 10-appliance.conf to take effect.
-	PasswordAuthentication yes
-	AuthenticationMethods any
-	PermitRootLogin yes
-	DEBUG
-	cat > /etc/APPLIANCE-DEBUG <<-'MARKER'
-	This image was built with debug password authentication enabled.
-	It is a diagnostic artifact and must never be deployed.
-	MARKER
-fi
+# What replaced it. The lab under QEMU reproduces a Droplet closely enough to have found every bug the
+# debug image was built to chase -- it fakes the metadata service, the `DO`/`Volume` SCSI disk and the
+# two-NIC arrangement, and OpenBao has been initialized, unsealed and served through it. And a node that
+# is genuinely unreachable is recovered with DigitalOcean's recovery ISO, which boots a rescue system
+# with this disk attached and needs nothing baked into the image to work.
+#
+# scripts/verify-image still asserts the absence of all three artifacts. Those checks now guard against
+# reintroduction rather than against releasing the wrong file.
 
 # No swap is configured and none should be. This is not a backstop but THE control: OpenBao 2.x has
 # dropped mlock, and upstream's replacement advice is exactly "disable or encrypt swap instead", so the
@@ -287,6 +349,21 @@ rm -f /usr/bin/python
 	exit 1
 }
 
+# Every virtual-terminal login, for a machine with no keyboard and no password.
+#
+# Root's password field is `*`, so no password can ever match and a getty on tty1 offers a prompt that
+# cannot be passed -- and with the debug build removed there is no longer any way to produce an image
+# where it can. It is a login prompt that exists only to be failed at.
+#
+# This costs nothing an operator uses. DigitalOcean's console still shows the whole boot, including
+# openbao-selfcheck's verdict, because that output comes from the kernel and OpenRC rather than from a
+# getty. ttyS0 keeps its getty: that is the serial console, and OpenRC writes there.
+sed -i '/^tty[1-6]:/d' /etc/inittab
+grep -q '^ttyS0:' /etc/inittab || {
+	echo "FATAL: the serial console getty was removed; DigitalOcean's console would show nothing" >&2
+	exit 1
+}
+
 # busybox's setuid helper. Stripped of its setuid bit, NOT deleted -- and the difference is the whole
 # boot.
 #
@@ -308,14 +385,28 @@ chmod u-s,g-s /bin/bbsuid
 # provokes the kernel into trying -- `mount -t squashfs` on a crafted image, say. This appliance mounts
 # exactly two filesystems, ext4 for its root and ext4 for the Raft volume, and speaks TCP over virtio.
 #
-# Kept deliberately: virtio-rng, because this host generates keys and wants entropy; nvme, because
+# Kept deliberately: virtio-rng, because this host generates keys and wants entropy; nvme/host, because
 # DigitalOcean's storage presentation is not guaranteed to stay virtio-blk; and the whole crypto and
 # ipv4/ipv6 trees.
+#
+# The net/ entries are the ones worth reading twice. Each is a protocol family the kernel will autoload
+# the moment anything calls socket() for it -- `socket(AF_KEY, ...)` is four lines of C, needs no
+# privilege, and loaded a parser this appliance has no use for. The original pruning covered netfilter,
+# sched, sctp, 9p, ceph, sunrpc and bridge and stopped there; these are the rest of the same argument.
+#
+# nvme/target is the NVMe-over-TCP *target*, a network-facing block protocol server, and it came in with
+# the deliberate decision to keep nvme/host. vhost and vdpa are the host side of virtio and do nothing in
+# a guest. hv is Hyper-V. arch/x86/kvm is not hypothetical: on the running appliance `lsmod` showed
+# kvm_amd and kvm loaded, 1.4 MiB of hypervisor that put itself into the secret store host unasked.
 release="$(ls /lib/modules | head -1)"
 modules="/lib/modules/$release/kernel"
 for dead in sound drivers/gpu drivers/usb drivers/md drivers/hid drivers/input \
             drivers/target drivers/message drivers/xen drivers/bluetooth \
-            net/netfilter net/sched net/sunrpc net/ceph net/sctp net/bridge net/9p; do
+            drivers/nvme/target drivers/vhost drivers/vdpa drivers/hv \
+            arch/x86/kvm \
+            net/netfilter net/sched net/sunrpc net/ceph net/sctp net/bridge net/9p \
+            net/key net/llc net/802 net/vmw_vsock net/l2tp net/openvswitch \
+            net/mpls net/nsh net/ife; do
 	rm -rf "${modules:?}/$dead"
 done
 
@@ -330,6 +421,12 @@ depmod -a "$release"
 # The kernel symbol map, which exists to decode an oops on a machine with a debugger attached. This one
 # sets ptrace_scope=3 and has no debugger, and the file is 6.1 MiB.
 rm -f /boot/System.map-*
+
+# The kernel's build configuration, and the extlinux configuration as it stood before setup.sh rewrote
+# the command line. Both are pure description of a machine an attacker is standing on: the first says
+# exactly which features and mitigations this kernel was compiled with, the second says what the boot
+# looked like before it was hardened.
+rm -f /boot/config-* /boot/extlinux.conf.old
 
 # syslinux's installable payload, 3.5 MiB. extlinux has already been installed into /boot by this point,
 # so what is left is the source material for an installation that has happened.
@@ -371,5 +468,17 @@ REMOVED
 dd if=/dev/zero of=/ZEROFILL bs=1M 2>/dev/null || true
 rm -f /ZEROFILL
 sync
+
+# The stamp that makes this script's failure visible to the build, and it is not a formality.
+#
+# alpine-make-vm-image reports a failed chroot script as `ERROR: Script failed` and still exits 0 --
+# measured, by failing this script deliberately. The build then compacted the half-finished image, and
+# `build:assert` passed it, because a partial image still contains the 186 MiB bao binary and clears the
+# 200 MiB floor that check was written for. So a build that stopped halfway through hardening produced an
+# artifact indistinguishable from a good one, at the exit code and at the size.
+#
+# /mnt is the stage directory bind-mounted into the chroot, so writing here puts the stamp where the host
+# can see it the moment the build returns. build:image removes it before every run.
+: > /mnt/setup-complete
 
 echo "==> setup complete"

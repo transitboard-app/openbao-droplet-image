@@ -3,11 +3,19 @@
 The DigitalOcean custom image the Transitboard OpenBao Droplets boot: a single-purpose Alpine appliance
 running OpenBao directly on the host.
 
-It replaces a Debian Droplet that installed podman at first boot and ran OpenBao in a container. What
-that arrangement could not do, and this one can, is let OpenBao **lock its memory** — the container's
-distroless binary ran as a non-root user with no `cap_ipc_lock`, so `disable_mlock = true` was
-mandatory and swap had to be disabled as a stand-in. Here the capability is granted ambiently and
-`openbao-selfcheck` proves the pages are locked.
+It replaces a Debian Droplet that installed podman at first boot and ran OpenBao in a container. What it
+buys is **attack surface**: 101 packages against about 210, no container runtime, no package manager, no
+interpreter, no shell for the service account, no setuid binary, and a kernel with the module tree cut
+down to what this machine actually uses. OpenBao runs directly on the host under an AppArmor profile that
+grants no capability of any kind — a stricter version of the `--read-only`, `--cap-drop ALL` and
+near-empty filesystem podman was providing, because it constrains the process rather than the container
+around it.
+
+It is **not** built so OpenBao can lock its memory. That was the original reason and it is dead: OpenBao
+2.x has dropped mlock support outright, `disable_mlock = false` is a fatal configuration error, and a
+Droplet with `CAP_IPC_LOCK` fully applied still showed `VmLck: 0`. What stands in its place is the
+absence of swap, which is upstream's own advice — see `AGENTS.md`, which exists mostly to stop this
+being reintroduced.
 
 ## Quick start
 
@@ -44,7 +52,7 @@ and chroots do not work over virtiofs.
 | `stage` | linux-x64 | Stages the overlay and mise's `bao`, asserting it is a linux-x64 ELF |
 | `build` | linux-x64 | Builds `out/openbao-appliance.qcow2` |
 | `verify` | linux-x64 | Mounts the image and asserts everything checkable without booting |
-| `boot` | any + qemu | Boots under QEMU on a serial console, legacy BIOS as DigitalOcean does |
+| `boot` | any + qemu | Boots under QEMU against a faked metadata service and Raft volume |
 | `compress` | any | bzip2, which DigitalOcean accepts and which suits a mostly-Go image |
 | `import <url>` | any | Registers a published URL as a DigitalOcean custom image |
 | `compare-upstream` | any + docker | Checks mise's `bao` against the binary in stack's pinned image |
@@ -66,7 +74,7 @@ elevating, because sudo resets `PATH` and would not otherwise see a mise-managed
 
 ## What is in the image, and what is not
 
-104 packages, against about 210 for the Debian-plus-podman node it replaces. `mise run verify` prints
+101 packages, against about 210 for the Debian-plus-podman node it replaces. `mise run verify` prints
 the count on every build rather than leaving it to be quoted from memory.
 
 Most of that reduction is not Alpine. It is dropping the container runtime (55 packages on its own) and
@@ -78,9 +86,9 @@ appliance runs needs an interpreter.
 There is no package manager, no shell for the `openbao` user, no interpreter, and no setuid binary.
 `mise run verify` fails if any of those reappear.
 
-Size is dominated by OpenBao itself: `bao` is 186 MiB of a roughly 290 MiB uncompressed image. Choosing
-a smaller distribution moves a number that was never the constraint — the reason to build this is the
-attack surface and the mlock, not the megabytes.
+Size is dominated by OpenBao itself: `bao` is 136 MiB stripped, of a 241 MiB image. Choosing a smaller
+distribution moves a number that was never the constraint — the reason to build this is the attack
+surface, not the megabytes.
 
 ## Releasing
 
@@ -119,8 +127,12 @@ material is in place. Install it, then start:
 # From stack, against the new node's private address
 scripts/generate-openbao-tls <node-private-address>
 scp .openbao/tls/{server.crt,server.key,ca.crt} root@<node>:/etc/openbao/tls/
-ssh root@<node> 'chown 65532:65532 /etc/openbao/tls/* && rc-service openbao start'
+ssh root@<node> 'rc-service openbao start'
 ```
+
+All three files are required — `ca.crt` because the listener names it as `tls_client_ca_file` — and the
+service applies `root:openbao` and the right modes to them itself on every start, so nothing here has to
+get a `chown` right.
 
 Every boot after that starts OpenBao on its own — which is a deliberate change from the Debian node,
 whose unit was installed disabled so a reboot could not skip the TLS step. With one node and no quorum,
@@ -132,9 +144,45 @@ Then check the claims:
 ssh root@<node> openbao-selfcheck
 ```
 
-That asserts AppArmor is enforcing, OpenBao is confined, `VmLck` is non-zero, `CAP_IPC_LOCK` is held,
-`no_new_privs` is set, the Raft volume is mounted, and no AppArmor denials have been recorded. It is
-the difference between the image being configured correctly and the node being correct.
+That asserts AppArmor is enforcing, OpenBao is confined, it holds no capabilities and runs as uid 65532,
+`no_new_privs` is set, there is no swap, the Raft volume is mounted, and no AppArmor denial has been
+recorded against the server. It is the difference between the image being configured correctly and the
+node being correct. It also runs at the end of every boot, so its verdict is on the serial console
+DigitalOcean's recovery console shows without anyone having to ask for it.
+
+### Operator commands run under the AppArmor profile
+
+A profile attaches to a path, so `profile openbao /usr/sbin/bao` confines **every** execution of that
+binary — including the one you type. That is mostly invisible, because the profile grants what the CLI
+needs, but two things follow from it and neither is a bug:
+
+- `openbao-selfcheck` reports denials from your own CLI as a separate, non-failing line. Only denials
+  against the running server are a failure.
+- The CLI cannot write to `/root` or `/tmp`, so **a Raft snapshot cannot be saved on the node**, and the
+  attempt fails with a permission error that reads like a fault. Take snapshots off the node instead,
+  which is how the command is meant to be used — it is an API client, not a node-local tool:
+
+  ```bash
+  # From stack. The CLI runs unconfined on your own machine; only TLS-wrapped API traffic crosses.
+  mise run openbao:tunnel -- bao operator raft snapshot save openbao-$(date +%F).snap
+  ```
+
+  This also keeps the `sudo`-capable token on the operator's machine rather than putting it on the node,
+  which is the reason the tunnel exists. See `documentation/openbao-operations.md` in stack for retention
+  and restore testing.
+
+### Logs
+
+`audit.log`, `stdout.log` and `stderr.log` live in `/var/log/openbao` on the Droplet's own disk, not on
+the Raft volume, because OpenBao refuses requests when every audit device fails to write and an audit log
+that filled the Raft volume would take the store down.
+
+They are bounded by `/usr/local/sbin/openbao-rotate-logs`, run every fifteen minutes by `crond`: 640 MiB
+of audit history and 64 MiB of operational log, so the logs cannot occupy more than about 3% of the
+smallest Droplet. The audit log is renamed and OpenBao is sent a `SIGHUP` to reopen it, which is
+upstream's documented protocol — the file audit device does not rotate itself. At the measured 5.8 KiB
+per operation that is a bit under a fortnight of audit records on the node; anything longer belongs in a
+store off the node.
 
 ## Status
 
@@ -148,33 +196,47 @@ the apk entries.
 Under QEMU in legacy BIOS mode:
 
 ```
+Kernel is locked down from command line; see man kernel_lockdown.7
 LSM: initializing lsm=lockdown,capability,landlock,yama,apparmor
 AppArmor: AppArmor initialized
  * Loading AppArmor profiles ... [ ok ]
    ++ expand_root: starting / done
  * No TLS material in /etc/openbao/tls.
- * Starting sshd ... [ ok ]
+ * openbao-selfcheck: all checks passed
 ```
 
 AppArmor is in the *active* LSM stack, not merely compiled in. The TLS gate refuses to start OpenBao and
-says how to fix it, which is the intended first-boot state. Root expansion is tiny-cloud's, measured: a
-1 GiB image on a 5 GiB disk ends with a 5118 MiB root filesystem.
+says how to fix it, which is the intended first-boot state — and the self-check now says so rather than
+reporting it as a fault. Root expansion is tiny-cloud's, measured: a 1 GiB image on a 5 GiB disk ends
+with a 5118 MiB root filesystem.
 
-104 packages, 0 setuid/setgid binaries, no interpreter, no package manager, no dangling symlinks.
-336 MiB qcow2, **148 MiB compressed**.
+101 packages, 0 setuid/setgid binaries, no interpreter, no package manager, no dangling symlinks, 370
+kernel modules in 11 MiB. 241 MiB qcow2, **95 MiB compressed**.
+
+**OpenBao has been run through this image.** Against a faked DigitalOcean environment — a SCSI disk
+presenting as vendor `DO` model `Volume`, a metadata service on `169.254.169.254`, and two interfaces —
+the appliance mounted its Raft volume through sysfs, read its private address, unsealed, served KV v2
+reads and writes, reported itself Raft leader, wrote audit records, survived a reboot with the store
+intact, and produced **zero AppArmor denials against the server** across all of it. `documentation/`
+holds the audit that established this and the one that preceded it.
 
 ### Still unsettled
 
 - **Never booted on a real Droplet.** DigitalOcean's own BIOS boot, metadata service and volume
-  attachment are all unproven.
-- **Networking has never come up.** Under QEMU the `networking` service fails for everything but `lo`,
-  because there is no DigitalOcean metadata for tiny-cloud to configure an interface from. That is
-  expected in the test environment and is exactly the thing that would make a real node unreachable, so
-  it proves nothing either way.
-- **OpenBao has never run**, because that needs TLS material. `VmLck`, `CAP_IPC_LOCK` and process
-  confinement are asserted by `openbao-selfcheck` and none has been observed true.
-- Root's password is locked, so DigitalOcean's recovery console cannot be used to log in. For an
-  appliance that is replaced rather than repaired that is arguably right, but it is a decision — if SSH
-  breaks, the node is rebuilt and the Raft volume reattached.
+  attachment are imitated by the lab and the lab is not a substitute for any of them.
+- **No credential has been minted against a real PostgreSQL instance.** The database secrets engine was
+  shown to load in-process — it does not fork, so the profile's blanket exec denial is not a problem —
+  and to reach `connect()`, but no database was stood up behind it.
+- **Agent sidecar injection from a Kubernetes cluster is unexercised**, as is real traffic over the pod
+  routes. `openbao-pod-routes` installs a route; nothing has come back along one.
+- `mitigations=auto,nosmt` is still not on the kernel command line. It can prevent boot and has not been
+  tested here; add it on its own, with a boot test.
+- **There is no way to log in at the console, by construction.** Root's password field is `*`, there is
+  no getty on any virtual terminal, and the `debug` build that used to bake in a password has been
+  removed. DigitalOcean's console still shows the whole boot including the self-check verdict, which is
+  what it is actually useful for. If SSH breaks, recovery is DigitalOcean's recovery ISO — it boots a
+  rescue system with this disk attached and needs nothing baked into the image — or rebuilding the node
+  and reattaching the Raft volume. That is a decision, not an accident, and it is worth re-reading before
+  the first real incident.
 
 `AGENTS.md` has the rest.

@@ -1,0 +1,82 @@
+#!/bin/sh
+# Bounds the three log files the appliance writes, so it cannot fill its own root disk.
+#
+# Why this exists at all: OpenBao refuses requests when every audit device fails to write, and the audit
+# device grows fast -- measured on this appliance, 20 `bao kv get` operations added 115,867 bytes, which
+# is 5.8 KiB per operation or about 477 MiB/day at one operation per second. The smallest Droplet has
+# 25 GiB. Putting the audit log on the Droplet's own disk rather than the Raft volume keeps a full log
+# from destroying the store, but it does not stop a full root filesystem from taking out the service.
+#
+# The two files are rotated differently, and the difference is not stylistic.
+#
+#   audit.log   RENAMED, then SIGHUP. This is upstream's documented protocol: "The device does not
+#               currently assist with any log rotation", and "Sending a SIGHUP to the OpenBao process
+#               will cause `file` audit devices to close and re-open their underlying file". Nothing is
+#               lost -- records written between the rename and the signal land in the renamed file.
+#
+#   stdout.log  COPIED, then truncated. These are supervise-daemon's redirections, not OpenBao's own
+#   stderr.log  files, and no signal makes supervise-daemon reopen them: renaming would leave the
+#               supervised process writing to the renamed inode forever, which is rotation that does not
+#               rotate. Truncating an O_APPEND file works, at the cost of losing whatever is written
+#               between the copy and the truncate. That trade is fine for an operational log and is not
+#               fine for an audit log, which is why audit.log does not use it.
+#
+# Run from /etc/periodic/15min by busybox crond. Fifteen minutes rather than hourly because the bound
+# should hold through a burst, and the work is three stat calls when nothing needs rotating.
+set -eu
+
+log_dir=/var/log/openbao
+
+# Ceilings, chosen against a 25 GiB disk: 640 MiB of audit history and 64 MiB of operational log, so the
+# logs can occupy under 3% of the smallest Droplet no matter what happens. At the measured 477 MiB/day
+# that is a bit under a fortnight of audit records on the node; anything longer belongs in a store off
+# the node, not on the disk the service depends on.
+audit_max_bytes=67108864
+audit_keep=10
+server_max_bytes=16777216
+server_keep=3
+
+# Oldest first, so nothing is overwritten before it has been shifted along.
+shift_backups() {
+	path="$1"
+	keep="$2"
+	index="$keep"
+	while [ "$index" -gt 1 ]; do
+		previous=$((index - 1))
+		if [ -f "$path.$previous" ]; then
+			mv -f "$path.$previous" "$path.$index"
+		fi
+		index="$previous"
+	done
+	rm -f "$path.$((keep + 1))"
+}
+
+too_big() {
+	[ -f "$1" ] || return 1
+	size="$(stat -c %s "$1" 2>/dev/null || echo 0)"
+	[ "$size" -ge "$2" ]
+}
+
+# The audit log. Renamed and signalled; see the header.
+if too_big "$log_dir/audit.log" "$audit_max_bytes"; then
+	shift_backups "$log_dir/audit.log" "$audit_keep"
+	mv -f "$log_dir/audit.log" "$log_dir/audit.log.1"
+	# Through OpenRC rather than by finding the pid, so this keeps working if the supervision changes.
+	# A failed signal is loud: the audit device would go on writing to audit.log.1 and the new file would
+	# never appear, which is a silent loss of audit records if nothing says so.
+	if ! rc-service openbao reload >/dev/null 2>&1; then
+		logger -t openbao-rotate-logs "rotated audit.log but could not signal OpenBao to reopen it"
+		exit 1
+	fi
+	logger -t openbao-rotate-logs "rotated audit.log"
+fi
+
+# supervise-daemon's redirections. Copied and truncated; see the header.
+for log in stdout.log stderr.log; do
+	if too_big "$log_dir/$log" "$server_max_bytes"; then
+		shift_backups "$log_dir/$log" "$server_keep"
+		cp -f "$log_dir/$log" "$log_dir/$log.1"
+		: > "$log_dir/$log"
+		logger -t openbao-rotate-logs "rotated $log"
+	fi
+done

@@ -65,12 +65,21 @@ alpine_mirror = "https://dl-cdn.alpinelinux.org/alpine"
 #
 # It has no effect on a running node at all: tiny-cloud grows the root filesystem to fill the Droplet's
 # disk on first boot, measured -- this image on a 5 GiB disk ends with a 5118 MiB root filesystem.
-# The checksum mise verified the OpenBao download against, repeated here only so the provenance file
-# inside the image can name what the stripped binary came from.
-bao_sha256 = "736b8ecf354fda6b2af62e4ae064f12fe6c52d7db8425b9c6de22f286a5485ec"
-
 image_size = "1G"
 image_name = "openbao-appliance"
+
+# The expected sha256 of the OpenBao binary, and the `stage:payload` task compares the staged bytes
+# against it before anything else touches them.
+#
+# That comparison is new, and its absence was a real gap rather than a tidiness one. The `[tools]` entry
+# above carries no `checksum` and there is no `mise.lock`, so nothing verified this download -- while the
+# `http:alpine-make-vm-image` entry beside it does carry one, which made the gap easy to miss. This value
+# was interpolated into the provenance file as `upstream <sha>` and compared to nothing, so a tampered
+# binary would have been recorded with the checksum it failed to match. This is the whole payload of a
+# secret store, fetched over the network on every build.
+#
+# Enabling mise's lockfile is the better long-term answer and would make this redundant.
+bao_sha256 = "736b8ecf354fda6b2af62e4ae064f12fe6c52d7db8425b9c6de22f286a5485ec"
 
 # Working directories, declared here rather than per task because the build: and boot: subtasks below
 # each own one step of a sequence and have to agree on where the previous step left its output.
@@ -173,6 +182,10 @@ run = [
 	"install -m 0755 {{ config_root }}/image/setup.sh {{ vars.stage_dir }}/setup.sh",
 	# mise put this on PATH from [tools]; here it is exactly the binary the image needs.
 	"""install -m 0755 "$(command -v bao)" {{ vars.stage_dir }}/bao""",
+	# The supply-chain check, and it has to happen here because nothing else performs one: the [tools]
+	# entry has no `checksum` and there is no mise.lock, so this download arrives unverified. Compared
+	# before `strip` runs, because after that the bytes are no longer upstream's.
+	"""test "$(sha256sum {{ vars.stage_dir }}/bao | cut -d' ' -f1)" = "{{ vars.bao_sha256 }}" || { echo 'FATAL: the OpenBao binary does not match bao_sha256; refusing to build' >&2; exit 1; }""",
 	# Asserted, not assumed: a staged binary of the wrong architecture would not surface until a Droplet
 	# booted and OpenBao never started. Read out of the ELF header rather than through `file`, which is
 	# not installed on a minimal Ubuntu and is not worth a package. Bytes 18-19 are e_machine,
@@ -187,7 +200,7 @@ run = [
 	# engineering it than to us.
 	"strip --strip-all {{ vars.stage_dir }}/bao",
 	# The one place the image is not byte-identical to what upstream published, so the link is recorded
-	# rather than lost. mise verified the download against a pinned checksum before any of this ran.
+	# rather than lost. The `upstream` value is the checksum asserted above, not merely quoted.
 	"""printf 'upstream %s\\nstripped %s\\n' "{{ vars.bao_sha256 }}" "$(sha256sum {{ vars.stage_dir }}/bao | cut -d' ' -f1)" > {{ vars.stage_dir }}/provenance""",
 	"""{{ vars.stage_dir }}/bao version >/dev/null || { echo 'bao does not run after stripping' >&2; exit 1; }""",
 	"""echo "staged bao: $(bao version | head -1)" """,
@@ -209,13 +222,36 @@ run = [{ task = "stage:overlay" }, { task = "stage:payload" }]
 #   the /dev/disk/by-id/scsi-0DO_Volume_* path the Raft volume is mounted from.
 # --serial-console because DigitalOcean's recovery console and QEMU both attach to ttyS0. Without it a
 #   failed boot is a black rectangle with no way to read the panic.
+#
+# There is deliberately no way to build a variant of this image. A `debug` task once baked a root
+# password and a `PasswordAuthentication yes` drop-in into a separately named artifact, and it is gone:
+# the whole task, the `--password` flag that fed it, and the marker file in the stage directory that
+# carried the password into the chroot. See image/setup.sh for what replaced it.
+#
+# Removing it also removed a defect rather than merely a feature. `stage` declares
+# sources=["image/**/*"], so mise skips it when nothing under image/ has changed, and `stage:payload` was
+# the only thing that wiped the stage directory -- so an interrupted debug build left its marker behind,
+# the next `mise run build` skipped staging, and it produced a password-authentication image under the
+# release filename. Reproduced:
+#
+#   --- second run, image/ unchanged ---
+#   [stage] sources up-to-date, skipping
+#   -rw-r--r-- debug-password
+#
+# `verify` would have caught it, but `verify` is a separate task and not a dependency of `build` -- only
+# the release workflow runs both. With no marker to leave behind there is nothing left to get wrong.
 [tasks."build:image"]
 description = "Run alpine-make-vm-image (needs root)"
-run = [
-	"mkdir -p {{ env.OUT_DIR }}",
-	"rm -f {{ env.IMAGE }}",
-	# `command -v` first, because sudo resets PATH and would not otherwise find a mise-managed tool.
-	"""sudo "$(command -v alpine-make-vm-image)" \
+run = """
+mkdir -p {{ env.OUT_DIR }}
+rm -f {{ env.IMAGE }}
+
+# setup.sh writes this as its last act, and build:assert refuses an image without it. Removed here so a
+# previous build's stamp cannot vouch for this one. See build:assert for what it catches.
+rm -f {{ vars.stage_dir }}/setup-complete
+
+# `command -v` first, because sudo resets PATH and would not otherwise find a mise-managed tool.
+sudo "$(command -v alpine-make-vm-image)" \
 		--image-format qcow2 \
 		--image-size "{{ vars.image_size }}" \
 		--arch x86_64 \
@@ -231,8 +267,8 @@ run = [
 		--fs-skel-dir {{ vars.skel_dir }} \
 		--script-chroot \
 		"$IMAGE" \
-		{{ vars.stage_dir }}/setup.sh""",
-]
+		{{ vars.stage_dir }}/setup.sh
+"""
 
 # alpine-make-vm-image can fail without failing: its dependency install reports an apk error and still
 # returns zero. The first build of this repository exited 0, printed "built", and had written no file at
@@ -244,6 +280,13 @@ description = "Assert the build produced a real image"
 # binary alone is 186 MiB, so the floor sits between the two.
 vars = { minimum_bytes = "209715200" }
 run = [
+	# The same failure as the comment above, one layer in and worse: a chroot script that dies partway
+	# also gets `ERROR: Script failed` and exit 0. Measured -- setup.sh was made to fail deliberately, and
+	# the build compacted the half-hardened image and passed every check here, because bao was already
+	# installed and the artifact cleared the floor below. Neither the exit code nor the size can tell a
+	# fully hardened image from one that stopped after `==> installing OpenBao`, so setup.sh stamps the
+	# stage directory as its last act and this is where the stamp is read.
+	"""test -f {{ vars.stage_dir }}/setup-complete || { echo "FATAL: setup.sh did not run to completion; the image is partially built" >&2; exit 1; }""",
 	"""test -s "$IMAGE" || { echo "FATAL: build reported success and produced no image" >&2; exit 1; }""",
 	"""test "$(stat -c %s "$IMAGE")" -ge {{ vars.minimum_bytes }} || { echo "FATAL: $IMAGE is too small to contain OpenBao" >&2; exit 1; }""",
 	"""sudo chown "$(id -u):$(id -g)" "$IMAGE" """,
@@ -264,34 +307,19 @@ description = "Build the appliance image (needs root)"
 depends = ["stage"]
 run = [{ task = "build:image" }, { task = "build:compact" }, { task = "build:assert" }]
 
-# Builds a diagnostic image with password authentication enabled, for when a Droplet boots unreachable
-# and there is no other way to read it. Deliberately not part of `build`, deliberately given its own
-# output name, and it cannot pass `verify` -- which asserts the opposite of everything it does.
-[tasks.debug]
-description = "Build a DEBUG image with password auth (never release this)"
-depends = ["stage"]
-usage = """
-flag "--password <password>" help="Root password to bake in" default="debug-only-throwaway"
-"""
-run = [
-	"""echo "{{ usage.password }}" > {{ vars.stage_dir }}/debug-password""",
-	{ task = "build:image" },
-	{ task = "build:compact" },
-	{ task = "build:assert" },
-	"""mv "$IMAGE" "$OUT_DIR/openbao-appliance-DEBUG.qcow2" """,
-	"""rm -f {{ vars.stage_dir }}/debug-password""",
-	"""bzip2 --keep --force --best "$OUT_DIR/openbao-appliance-DEBUG.qcow2" """,
-	"""ls -lh "$OUT_DIR/openbao-appliance-DEBUG.qcow2.bz2" """,
-]
-
 [tasks.verify]
 description = "Assert the built image's contents without booting it"
 run = "sudo {{ config_root }}/scripts/verify-image {{ env.IMAGE }}"
 
 # A scratch copy, so a boot test cannot dirty the artifact that is about to be uploaded. Optionally
 # grown first, which is how root-filesystem expansion gets exercised without a real Droplet.
+#
+# The second disk is the Raft volume. It is presented to the guest as SCSI vendor "DO", model "Volume"
+# by boot:run, which is what /etc/init.d/openbao-volume scans sysfs for -- and it carries an ext4
+# filesystem because that service mounts rather than formats. Without it the volume service fails,
+# openbao is correctly never started, and the boot test cannot reach the TLS gate.
 [tasks."boot:prepare"]
-description = "Copy the image to a scratch disk, optionally resized"
+description = "Copy the image to a scratch disk and make a scratch Raft volume"
 usage = """
 flag "--disk-size <size>" help="Resize the scratch copy to this size" default=""
 """
@@ -300,6 +328,8 @@ run = [
 	"mkdir -p {{ vars.boot_work }}",
 	"""cp "$IMAGE" {{ vars.boot_work }}/disk.qcow2""",
 	"""test -z "{{ usage.disk_size }}" || qemu-img resize {{ vars.boot_work }}/disk.qcow2 {{ usage.disk_size }}""",
+	"truncate -s 1G {{ vars.boot_work }}/volume.raw",
+	"mkfs.ext4 -q -F {{ vars.boot_work }}/volume.raw",
 ]
 
 # DigitalOcean boots Droplets in legacy BIOS mode, which is what this matches.
@@ -319,10 +349,30 @@ run = """
 log={{ vars.boot_work }}/boot.log
 : > "$log"
 
+# Three things beyond a plain boot, each of which a service now hard-depends on:
+#
+#   two NICs    because the image configures eth0 and eth1 and DigitalOcean serves DHCP on both. One NIC
+#               leaves net.eth1 permanently failed, which rc_depend_strict="NO" survives but which is not
+#               the arrangement a Droplet has.
+#   guestfwd    a fake metadata service at 169.254.169.254, answered per connection by
+#               scripts/fake-metadata. /etc/init.d/metadata is a `need` of both openbao and
+#               cloud-ssh-keys, so without this OpenRC refuses to start either and the boot test measures
+#               nothing past DHCP. It has to hang off the SECOND netdev, whose guest network is
+#               169.254.169.0/24: QEMU rejects a guestfwd to an address outside the netdev's own network
+#               with `Conflicting/invalid host:port in guest forwarding rule`, which reads as a syntax
+#               error rather than an addressing one.
+#   scsi-hd     the Raft volume, presented as vendor DO / model Volume, which is what openbao-volume
+#               scans /sys/block/sd* for. The Droplet's own disk stays virtio, so it is not a candidate.
 qemu-system-x86_64 \
 	-machine q35 -m 1024 -smp 2 \
-	-drive file={{ vars.boot_work }}/disk.qcow2,format=qcow2,if=virtio \
+	-drive file={{ vars.boot_work }}/disk.qcow2,format=qcow2,if=none,id=root \
+	-device virtio-blk-pci,drive=root,bootindex=0 \
+	-device virtio-scsi-pci,id=scsi0 \
+	-drive file={{ vars.boot_work }}/volume.raw,format=raw,if=none,id=vol \
+	-device scsi-hd,drive=vol,bus=scsi0.0,vendor=DO,product=Volume,serial=boot-test \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+	-netdev "user,id=n1,net=169.254.169.0/24,host=169.254.169.1,dhcpstart=169.254.169.20,guestfwd=tcp:169.254.169.254:80-cmd:{{ config_root }}/scripts/fake-metadata" \
+	-device virtio-net-pci,netdev=n1 \
 	-nographic -display none -serial file:"$log" >/dev/null 2>&1 &
 qemu=$!
 
@@ -355,13 +405,24 @@ run = [
 	"""grep -q "No TLS material" {{ vars.boot_work }}/boot.log || { echo "FATAL: the openbao service never ran its TLS gate" >&2; exit 1; }""",
 	# The regression check for the bug that shipped three times. Nothing provided `net`, so every service
 	# declaring `need net` -- tiny-cloud-main and cloud-ssh-keys both -- silently never ran, and the node
-	# booted, answered on port 22 and installed no keys. This asserts the service RAN; it cannot assert
-	# success, because QEMU has no metadata service for it to succeed against.
-	"""grep -q "Fetching SSH keys" {{ vars.boot_work }}/boot.log || { echo "FATAL: cloud-ssh-keys never ran; nothing provided net" >&2; exit 1; }""",
+	# booted, answered on port 22 and installed no keys. Now that boot:run serves metadata, this asserts
+	# the key was actually INSTALLED rather than merely that the service ran.
+	"""grep -q "Installed 1 key(s) for root" {{ vars.boot_work }}/boot.log || { echo "FATAL: cloud-ssh-keys installed no key; the node would be unreachable" >&2; exit 1; }""",
+	# The service everything else now depends on. If this never answers, openbao and cloud-ssh-keys are
+	# both correctly refused -- so an assertion failure here explains every other one below it.
+	"""grep -q "Droplet 7654321" {{ vars.boot_work }}/boot.log || { echo "FATAL: the metadata service was never read" >&2; exit 1; }""",
+	# Found through sysfs, on a disk with no /dev/disk/by-id entry, which is the arrangement a Droplet
+	# actually presents and the one that took a real node to discover.
+	"""grep -q "Mounting Raft volume /dev/sd" {{ vars.boot_work }}/boot.log || { echo "FATAL: the Raft volume was not found through sysfs" >&2; exit 1; }""",
 	# udhcpc, not the service name: OpenRC logs "Starting networking ... eth0", and the string "net.eth0"
 	# appears in the log only when an interface FAILS. Asserting on it made a passing boot look broken.
 	"""grep -q "udhcpc: started" {{ vars.boot_work }}/boot.log || { echo "FATAL: no interface ran DHCP" >&2; exit 1; }""",
-	"""echo "boot reached OpenRC, loaded AppArmor, and gated on TLS as intended" """,
+	# The self-check is what turns this image's claims into facts, and for a long time nothing ran it: it
+	# was called "the boot-time self-check" in two places while no runlevel referenced it. This asserts it
+	# reached the console. It cannot assert the verdict -- under QEMU there is no metadata service, so
+	# OpenBao is correctly not running and the check says so rather than passing or failing.
+	"""grep -q "openbao-selfcheck:" {{ vars.boot_work }}/boot.log || { echo "FATAL: openbao-selfcheck never ran at boot" >&2; exit 1; }""",
+	"""echo "boot: AppArmor enforcing, metadata read, key installed, Raft volume mounted, TLS gate held" """,
 ]
 
 # Arguments come from usage's template values, not the Tera arg and flag functions, which mise deprecates
@@ -425,7 +486,7 @@ echo "  mise:      $(sha256sum "$(command -v bao)" | cut -d' ' -f1)"
 
 [tasks.lint]
 description = "Shellcheck the runtime scripts the image ships"
-run = "shellcheck --shell=sh --severity=warning scripts/verify-image image/setup.sh image/overlay/etc/init.d/* image/overlay/usr/local/sbin/openbao-selfcheck"
+run = "shellcheck --shell=sh --severity=warning scripts/verify-image scripts/fake-metadata image/setup.sh image/overlay/etc/init.d/* image/overlay/usr/local/sbin/*"
 
 [tasks.clean]
 description = "Remove build outputs and staging"

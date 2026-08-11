@@ -48,7 +48,23 @@ for proc in /proc/[0-9]*; do
 	pid="${proc#/proc/}"
 	break
 done
-check "running"                      '[ -n "'"$pid"'" ]'
+
+# First boot is not a failure, and saying so is what keeps this script worth reading. The service refuses
+# to start until an operator has installed TLS material, so on a node that has not had it yet OpenBao is
+# correctly absent -- and a check that reports the intended first-boot state as a fault is one people
+# learn to skip.
+configured=0
+if [ -f /etc/openbao/tls/server.crt ]; then
+	configured=1
+fi
+
+if [ "$configured" = 0 ]; then
+	echo "  ....  no TLS material in /etc/openbao/tls, so OpenBao is correctly not running yet"
+	echo "        install it and start the service; README.md has the procedure"
+else
+	check "running"                   '[ -n "'"$pid"'" ]'
+fi
+
 if [ -n "$pid" ]; then
 	# No capabilities, which is the correct assertion now that there is nothing to grant one for.
 	# OpenBao 2.x dropped mlock support, so the CAP_IPC_LOCK this once required -- and the
@@ -61,7 +77,7 @@ if [ -n "$pid" ]; then
 	# The confinement label of this specific process, which is the question the profile existing does
 	# not answer: a loaded profile that never attached leaves OpenBao unconfined with nothing to say so.
 	check "confined by openbao profile" 'grep -q "^openbao (enforce)" /proc/'"$pid"'/attr/current'
-else
+elif [ "$configured" = 1 ]; then
 	echo "  ....  OpenBao is not running, so its privilege and confinement checks did not run"
 fi
 
@@ -72,15 +88,40 @@ echo "Host"
 check "no swap active"               '[ "$(awk "NR>1" /proc/swaps | wc -l)" -eq 0 ]'
 check "core dumps discarded"         'grep -q "/bin/false" /proc/sys/kernel/core_pattern'
 check "ptrace_scope is 3"            '[ "$(cat /proc/sys/kernel/yama/ptrace_scope)" = "3" ]'
-check "raft volume mounted"          'mountpoint -q /var/lib/openbao'
+# Mounted by the service's start_pre, so it is only expected once the service has been able to start.
+if [ "$configured" = 1 ]; then
+	check "raft volume mounted"      'mountpoint -q /var/lib/openbao'
+fi
 check "no package manager"           '! command -v apk'
 check "no shell for openbao user"    'grep "^openbao:" /etc/passwd | grep -q nologin'
 
 echo "AppArmor denials since boot"
-if dmesg 2>/dev/null | grep -q 'apparmor="DENIED"'; then
-	echo "  denials recorded -- the profile is too tight somewhere:"
-	dmesg | grep 'apparmor="DENIED"' | tail -10 | sed 's/^/    /'
+# Scoped to the server, deliberately, and this is the difference between a check that gets read and one
+# that does not.
+#
+# The profile attaches to /usr/sbin/bao, so it confines the CLI an operator types as well as the server:
+# every `bao` command run by hand appears here under profile="openbao". This section used to grep all of
+# dmesg, so using the CLI once turned a fully green node into one reporting "the profile is too tight
+# somewhere" for the rest of its uptime -- a normal operation permanently failing the check.
+#
+# So: denials against the running server are a failure, and everything else is counted and named. Nothing
+# is hidden, and the line an operator has to act on is the one that says FAIL.
+denials="$(dmesg 2>/dev/null | grep 'apparmor="DENIED"' || true)"
+server_denials=""
+if [ -n "$pid" ] && [ -n "$denials" ]; then
+	server_denials="$(printf '%s\n' "$denials" | grep -E "pid=$pid( |\$)" || true)"
+fi
+other="$(printf '%s\n' "$denials" | grep -cE 'apparmor="DENIED"' || true)"
+
+if [ -n "$server_denials" ]; then
+	echo "  FAIL  the profile is too tight for the server (pid $pid):"
+	printf '%s\n' "$server_denials" | tail -10 | sed 's/^/    /'
 	fail=1
+elif [ "$other" -gt 0 ]; then
+	# Almost always the operator's own CLI, which is confined by the same profile and denied things the
+	# server never asks for. Shown rather than swallowed, because a denial from anything else matters.
+	echo "  none against the server; $other denial(s) from other processes under this profile:"
+	printf '%s\n' "$denials" | tail -3 | sed 's/^/    /'
 else
 	echo "  none"
 fi

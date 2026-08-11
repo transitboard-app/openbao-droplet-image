@@ -1,0 +1,42 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # openrc-run reads these variables out of this file; nothing here uses
+# them directly, so shellcheck cannot see the consumer.
+# Runs /usr/local/sbin/openbao-selfcheck at the end of every boot.
+#
+# The script it runs is the part of this image that turns configuration into fact -- AppArmor enforcing,
+# the process confined, no capabilities, no swap. It has always existed and, until this service, it ran
+# only when a human typed it, which is the one case where a check is least needed. `image/packages` and
+# `AGENTS.md` both called it "the boot-time self-check" while nothing in any runlevel referenced it.
+#
+# Its output lands on the serial console, which is what DigitalOcean's recovery console shows, and a
+# one-line verdict goes to the system log so it survives the scrollback.
+
+description="Assert at boot that this node's security properties are true"
+
+depend() {
+	# Late, so what it reports is the finished node rather than one mid-boot. `after` is ordering only,
+	# so this still runs when openbao failed to start -- which is the state it most needs to describe.
+	after openbao openbao-pod-routes sshd
+}
+
+start() {
+	einfo "Checking this node's security properties"
+	if output="$(/usr/local/sbin/openbao-selfcheck 2>&1)"; then
+		verdict="all checks passed"
+	else
+		verdict="FAILURES above; run openbao-selfcheck for detail"
+	fi
+	printf '%s\n' "$output" | sed 's/^/  /'
+	einfo "openbao-selfcheck: $verdict"
+	logger -t openbao-selfcheck "$verdict" 2>/dev/null || true
+
+	# ALWAYS zero, deliberately. A failing assertion is something an operator must see, not something that
+	# should stop a node coming up: refusing to finish the boot would take away sshd and the recovery
+	# console, which are the only ways to act on what it just reported.
+	return 0
+}
+
+stop() {
+	return 0
+}

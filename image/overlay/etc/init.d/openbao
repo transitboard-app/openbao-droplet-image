@@ -17,6 +17,18 @@ command_user="openbao:openbao"
 
 supervisor="supervise-daemon"
 supervise_daemon_args="--stdout /var/log/openbao/stdout.log --stderr /var/log/openbao/stderr.log"
+# OpenRC's own default for a supervise-daemon service, written out rather than inherited because
+# reload() below reads it and a silently different path would mean a rotated audit log never reopened.
+pidfile="/run/supervise-${RC_SVCNAME}.pid"
+
+# SIGHUP, which is how a rotated audit log gets reopened. Upstream: "Sending a SIGHUP to the OpenBao
+# process will cause `file` audit devices to close and re-open their underlying file." Without this,
+# /usr/local/sbin/openbao-rotate-logs renames audit.log and OpenBao keeps writing to the renamed inode --
+# rotation that does not rotate, losing audit records with nothing to say so.
+#
+# OpenBao treats SIGHUP as a configuration reload, so this also picks up replaced TLS material without a
+# restart. A reload that cannot be applied is logged and the server keeps running on what it had.
+extra_started_commands="reload"
 
 # No capabilities at all, deliberately, and the history is worth keeping because it was wrong twice.
 #
@@ -43,86 +55,85 @@ no_new_privs="yes"
 # ambient capability failed to apply, and has nothing left to do.
 rc_ulimit="-n 65536"
 
+# Respawn forever, chosen rather than inherited.
+#
+# Alpine's /etc/rc.conf defaults are respawn_delay=2, respawn_max=5, respawn_period=1800: five crashes in
+# thirty minutes and supervise-daemon gives up, leaving the store down until somebody notices. With one
+# node and no quorum that is the whole availability story gone, and it is the same failure this service
+# is enabled at boot to avoid -- a secret store that stays down after an unattended event is worse than
+# one that starts too eagerly.
+#
+# `respawn_max=0` is unlimited. The delay goes to ten seconds so a genuinely fatal cause -- a
+# configuration error the server refuses to load, as `disable_mlock = false` once was -- writes a
+# readable log rather than a scrolling one.
+respawn_delay=10
+respawn_max=0
+
 depend() {
-	need net localmount
+	# `need`, not `after`, for both of the new ones, and that is the point of them existing. OpenBao
+	# cannot run without the Raft volume mounted or without knowing its own private address, so those are
+	# dependencies rather than orderings -- OpenRC starts them, refuses to start this if either fails, and
+	# names the one that failed. What used to be here instead was a start_pre that did all three jobs and
+	# reported every failure as "openbao failed to start".
+	need net localmount metadata openbao-volume
 	after tiny-cloud-main chronyd apparmor
+}
+
+reload() {
+	ebegin "Reloading $name"
+	supervise-daemon "$RC_SVCNAME" --signal HUP --pidfile "$pidfile"
+	eend $? "Could not signal OpenBao; a rotated audit log would not be reopened"
 }
 
 start_pre() {
 	# The TLS gate. Equivalent to ConditionPathExists= on the systemd unit: refuse to start rather than
 	# restart-loop against material the operator has not installed yet. Returning 1 here makes OpenRC
 	# report a clean failure with this message, which is what the operator needs to see on first boot.
-	if [ ! -f /etc/openbao/tls/server.crt ] || [ ! -f /etc/openbao/tls/server.key ]; then
+	#
+	# ca.crt is gated with the other two because openbao.hcl names it as tls_client_ca_file: without it
+	# the server does not fail this check and then refuses to load, which reads as a configuration bug
+	# rather than as a missing file.
+	if [ ! -f /etc/openbao/tls/server.crt ] || [ ! -f /etc/openbao/tls/server.key ] ||
+		[ ! -f /etc/openbao/tls/ca.crt ]; then
 		eerror "No TLS material in /etc/openbao/tls."
 		eerror "Generate it with stack's scripts/generate-openbao-tls <node-private-address>,"
-		eerror "copy server.crt, server.key and ca.crt here owned by uid 65532, then start again."
+		eerror "copy server.crt, server.key and ca.crt here, then start again."
 		return 1
 	fi
 
-	# The Raft volume, mounted on demand rather than from fstab.
+	# Ownership and modes applied here rather than left to the operator's `scp` and a README step.
 	#
-	# This is the trap the systemd unit solved with noauto + RequiresMountsFor, and it is worth
-	# restating because getting it wrong is silent and destroys the store: the DigitalOcean volume is
-	# attached by a separate API call that cannot run until the Droplet exists, so at first boot the
-	# device is genuinely absent. Mounting from fstab at boot fails; NOT mounting at all is worse,
-	# because OpenBao then writes its Raft store to the Droplet's own disk while the attached volume
-	# sits empty and nothing says so.
+	# root:openbao, not 65532:65532. The AppArmor profile attaches to /usr/sbin/bao, so it confines the
+	# CLI an operator types as well as the server, and it grants no capability -- which meant a directory
+	# owned by 65532 was unreadable to a confined root and every `bao` command on the node failed on its
+	# own CA file. See image/setup.sh for the full account. The server reads the key through the group.
 	#
-	# So: mount here, and refuse to start if it cannot be mounted.
-	if ! mountpoint -q /var/lib/openbao; then
-		device="${RAFT_DEVICE:-}"
-		if [ -z "$device" ]; then
-			# Ask the kernel what is attached, rather than asking udev.
-			#
-			# DigitalOcean documents the volume as /dev/disk/by-id/scsi-0DO_Volume_<name>, and that path
-			# is real -- on their Debian and Ubuntu images, where udev creates it. This image runs mdev,
-			# which builds /dev/disk/by-label, by-uuid and by-partlabel out of blkid and leaves
-			# /dev/disk/by-id EMPTY. Globbing it therefore matched nothing on a Droplet whose volume was
-			# attached and perfectly healthy. Neither of the directories mdev does populate helps: a
-			# DigitalOcean volume carries no filesystem label, and its UUID is made at create time, so
-			# an image built long beforehand cannot know it.
-			#
-			# sysfs has what is actually needed. A DigitalOcean block volume presents as SCSI vendor
-			# "DO", model "Volume"; the Droplet's own disk is virtio and appears as vda, so it is not a
-			# candidate and cannot be selected by accident.
-			#
-			# One volume per node, so exactly one match is the expected case. Zero or several is a
-			# situation for an operator, not for a guess about which disk holds the secrets.
-			set --
-			for sys in /sys/block/sd*; do
-				[ -e "$sys/device/vendor" ] || continue
-				read -r vendor < "$sys/device/vendor"
-				read -r model < "$sys/device/model"
-				case "$vendor" in DO) ;; *) continue ;; esac
-				case "$model" in Volume) ;; *) continue ;; esac
-				set -- "$@" "/dev/${sys##*/}"
-			done
-			if [ "$#" -eq 1 ] && [ -b "$1" ]; then
-				device="$1"
-			else
-				eerror "Expected exactly one DigitalOcean volume, found $#."
-				eerror "Set RAFT_DEVICE in /etc/conf.d/openbao to choose explicitly."
-				return 1
-			fi
-		fi
+	# The key is 0640 and the certificates 0644, which is also why this is not a blanket chmod: a
+	# world-readable private key is the one mistake here that would not announce itself.
+	chown root:openbao /etc/openbao/tls/server.crt /etc/openbao/tls/server.key /etc/openbao/tls/ca.crt
+	chmod 0640 /etc/openbao/tls/server.key
+	chmod 0644 /etc/openbao/tls/server.crt /etc/openbao/tls/ca.crt
 
-		ebegin "Mounting Raft volume $device"
-		mount -t ext4 -o defaults,noatime "$device" /var/lib/openbao
-		eend $? "Could not mount the Raft volume; refusing to start on the Droplet's own disk" || return 1
-	fi
-
-	# Ownership is applied after the mount, not before: it has to land on the mounted filesystem rather
-	# than on the empty directory underneath it. Idempotent, so this is safe on every start.
-	install -d -o 65532 -g 65532 -m 0700 /var/lib/openbao
+	# The Raft volume and the metadata read used to live here. Both are now services of their own --
+	# /etc/init.d/openbao-volume and /etc/init.d/metadata -- declared with `need` in depend() above, so a
+	# failure in either is reported against the thing that failed rather than as "openbao failed to start".
+	#
+	# This directory is not on the Raft volume, so it is this service's to create.
 	install -d -o 65532 -g 65532 -m 0700 /var/log/openbao
 
-	# The address clients dial. Not templated into the image, because it is this node's own private
-	# address and the image is built long before any node exists. The private interface is deliberate:
-	# the firewall admits 8200 only from tagged Droplets and the cluster pod ranges, so the public
-	# address is not a path anything can use.
-	address="$(wget -qO- -T 5 http://169.254.169.254/metadata/v1/interfaces/private/0/ipv4/address 2>/dev/null || true)"
+	# The address clients dial. Not templated into the image, because it is this node's own private address
+	# and the image is built long before any node exists. The private interface is deliberate: the firewall
+	# admits 8200 only from tagged Droplets and the cluster pod ranges, so the public address is not a path
+	# anything can use.
+	#
+	# Read from the cache the metadata service wrote, with no fetch and no retry here. A Droplet created
+	# without VPC networking has no private address at all, which is why `metadata` succeeds without one and
+	# this is where it becomes an error.
+	address="$(cat /run/metadata/private-address 2>/dev/null || true)"
 	if [ -z "$address" ]; then
-		eerror "Could not read this node's private address from the metadata service."
+		eerror "This node has no private address in the metadata service."
+		eerror "OpenBao advertises one to its clients and cannot start without it; a Droplet created"
+		eerror "without VPC networking cannot serve this cluster."
 		return 1
 	fi
 	export BAO_API_ADDR="https://${address}:8200"

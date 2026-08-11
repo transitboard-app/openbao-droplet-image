@@ -30,8 +30,8 @@ none. On macOS this directory has no tasks at all. Do not add a `mise.toml` to "
 
 ## The things most likely to be got wrong
 
-Every one of these was got wrong here first, and three of the four looked correct until the image ran on
-a real Droplet. Local verification cannot reach them.
+Every one of these was got wrong here first, and most of them looked correct until the image was run —
+on a real Droplet, or under a lab imitating one. Reading the recipe cannot reach any of them.
 
 **AppArmor is compiled in but not enabled by default.** `linux-virt` sets
 `CONFIG_SECURITY_APPARMOR=y` and ships
@@ -65,6 +65,33 @@ would override the `/var/lib/openbao/** rwk` grant and OpenBao could not write i
 Confinement comes from the whitelist, not from blanket denials. Only `deny /** x` is safe, because
 nothing is granted exec anywhere.
 
+**A dependency cannot be declared on the metadata service, so exactly one service waits for it.**
+`need net` means an interface is configured. It cannot mean "the hypervisor is answering HTTP on
+`169.254.169.254`", because that endpoint is not a service on this machine and OpenRC has no handle on
+it — and DHCP completing does not imply the metadata service is serving. So the wait is a retry loop, and
+it lives in `/etc/init.d/metadata`, which caches what it reads to `/run/metadata` and `provide`s a
+virtual. `cloud-ssh-keys` and `openbao` declare `need metadata` and read files; neither contains a URL.
+Do not give a consumer its own fetch. That is what was here before, and the two copies diverged — one
+retried fifteen times, the other tried once and produced a node that answered on port 22 with no secret
+store. Assert the wait once, or it will be got wrong twice.
+
+**The AppArmor profile confines the CLI as well as the server, because a profile attaches to a path.**
+`profile openbao /usr/sbin/bao` covers every execution of that binary, including the one an operator
+types. This is not a mistake to fix by adding a second unconfined path — it is a property to design
+around, and two things follow from it. `/etc/openbao/tls` is `root:openbao 0750` rather than
+`65532:65532 0700` precisely so a confined root can read the CA without a capability; owning the
+directory by uid also meant OpenBao could rewrite its own private key, which it now cannot. And a Raft
+snapshot cannot be written on the node at all, so snapshots are taken through stack's `openbao:tunnel`,
+which is how the command is meant to be used — it is an API client, not a node-local tool. Anything that
+makes an operator reach for `-tls-skip-verify` is a bug in this image, not an operator error.
+
+**The audit device does not rotate itself, and a full root filesystem is an outage.** Upstream is
+explicit: the `file` device "does not currently assist with any log rotation", and a `SIGHUP` makes it
+close and reopen. OpenBao refuses requests when every audit device fails to write, so an unbounded audit
+log — 5.8 KiB per operation, measured — takes the store down with the disk. `crond` runs
+`openbao-rotate-logs` every fifteen minutes for exactly this, and `rc-service openbao reload` is the
+signal path it depends on. Do not remove either without replacing what it does.
+
 ## Applies to every change
 
 - Every property this image claims must be asserted by something that fails loudly. Configuration is a
@@ -82,12 +109,12 @@ nothing is granted exec anywhere.
 
 ## What is not settled
 
-- Whether the AppArmor profile is tight enough. It has now run against a real OpenBao serving on a
-  Droplet, which produced exactly one denial — `@{PROC}/@{pid}/mountinfo`, since granted — but that node
-  was sealed the whole time. Unsealing, PostgreSQL credential minting and Agent injection have not
-  exercised it yet. `openbao-selfcheck` reports denials since boot; that output is the next revision.
-- The kernel command line carries no `lockdown=` and no `mitigations=` yet. Each can prevent boot. Add
-  them one at a time, with a boot test each.
-- Nothing has read from OpenBao through this image yet. It boots, mounts its Raft volume, loads an
-  existing store and serves TLS on 8200; it has never been unsealed, so no client has completed a
-  request against it.
+- Whether the AppArmor profile is tight enough for the last two uses. Unsealing, KV reads and writes,
+  policy writes, AppRole, audit, leader election and a full restart now produce **zero** denials against
+  the server. The database secrets engine loads in-process and reaches `connect()`, so the blanket exec
+  denial is not the problem it looked like — but no credential has been minted against a real PostgreSQL
+  instance, and Agent injection from a cluster has not been exercised.
+- The kernel command line carries `lockdown=integrity` and `module.sig_enforce=1`, both boot-tested
+  alone. It still carries no `mitigations=`. That can prevent boot; add it on its own, with a boot test.
+- Nothing has run on a real Droplet since the appliance was rewritten. The lab imitates DigitalOcean's
+  volume presentation, metadata service and two-NIC arrangement, and is not a substitute for any of them.

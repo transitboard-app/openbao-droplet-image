@@ -1,0 +1,45 @@
+#!/bin/sh
+# Answers ONE connection to a fake DigitalOcean metadata service, for the boot test.
+#
+# QEMU's `guestfwd=tcp:169.254.169.254:80-cmd:<this>` runs this per connection with stdin and stdout
+# wired to the guest's socket, so there is no daemon, no port on the host and no dependency beyond a
+# POSIX shell. The `cmd:` form matters: the chardev form multiplexes every guest connection onto one
+# stream and answers about two requests before going silent, which reads as a flaky metadata service.
+#
+# This exists because /etc/init.d/metadata is a hard dependency of both openbao and cloud-ssh-keys. Under
+# a QEMU with nothing at 169.254.169.254, that service fails first and OpenRC correctly refuses to start
+# either -- so the boot test could no longer reach the TLS gate or the key installer, and was asserting
+# on messages that could never appear. A boot test that cannot reach the interesting services is not
+# measuring the image.
+#
+# It is a test fixture and is never installed into the image.
+
+cr="$(printf '\r')"
+
+# The request line, then the headers, drained to the blank line before answering -- replying and exiting
+# while the client is still writing gets the connection reset.
+read -r _method path _version || exit 0
+while IFS= read -r header; do
+	[ -z "${header%"$cr"}" ] && break
+done
+
+# A syntactically valid key that opens nothing: this is a throwaway public key, and the boot test only
+# needs cloud-ssh-keys to have something well-formed to install.
+key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGVvV0hEQm9vdFRlc3RLZXlOb3RBUmVhbEtleQAA boot-test@invalid"
+
+case "${path%"$cr"}" in
+	/metadata/v1/id)                                   body="7654321" ;;
+	/metadata/v1/hostname)                             body="openbao-boot-test" ;;
+	/metadata/v1/region)                               body="lon1" ;;
+	/metadata/v1/interfaces/private/0/ipv4/address)    body="169.254.169.20" ;;
+	/metadata/v1/interfaces/public/0/ipv4/address)     body="10.0.2.15" ;;
+	/metadata/v1/public-keys)                          body="$key" ;;
+	/metadata/v1/user-data)                            body="" ;;
+	*)
+		printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+		exit 0
+		;;
+esac
+
+printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+	"${#body}" "$body"

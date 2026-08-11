@@ -4,7 +4,7 @@
 # the node, or to run and confine OpenBao. Nothing here is for convenience -- there is no shell to be
 # convenient in and no package manager to add one with once the image is built.
 #
-# Blank lines and # comments are stripped by scripts/build-image.
+# Blank lines and # comments are stripped by the build:image task in mise.linux-x64.toml.
 
 # Break-glass access, and the transport for both of stack's tunnels. `openbao:tunnel` and `db:tunnel`
 # are `ssh -L` port forwards through this node, so sshd is load-bearing operations tooling rather than
@@ -27,9 +27,14 @@ apparmor-openrc
 apparmor-profiles-abstractions
 apparmor-profiles-tunables
 
-# getpcaps, used by the boot-time self-check to prove OpenBao actually holds CAP_IPC_LOCK rather than
-# merely having been asked to.
-libcap-utils
+# libcap-utils was here for getpcaps, "used by the boot-time self-check to prove OpenBao actually holds
+# CAP_IPC_LOCK". That reason died twice over: the capability was removed when OpenBao 2.x turned out to
+# have dropped mlock, and openbao-selfcheck reads CapEff out of /proc/<pid>/status with awk. Nothing in
+# the image referenced getpcaps.
+#
+# What the package did put on the appliance is /usr/sbin/setcap and /usr/sbin/capsh -- a tool for granting
+# file capabilities and a tool for manipulating capability sets -- on a machine whose entire premise is
+# that nothing holds a capability. Removing it drops all four files, libcap.so.2 included.
 
 # resize2fs and sfdisk, for growing the root filesystem into the Droplet's disk on first boot. The
 # image is 1 GiB and the smallest Droplet has 25 GiB.

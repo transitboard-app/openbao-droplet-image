@@ -1,7 +1,0 @@
-# Per-node overrides for the openbao service. The image ships this empty on purpose: a working node
-# needs nothing set here.
-
-# The Raft volume's device. Leave unset and the service finds the single attached DigitalOcean volume
-# by itself, which is the expected case. Set it only when a node has more than one volume attached and
-# the choice of which holds the secret store should not be inferred.
-#RAFT_DEVICE="/dev/disk/by-id/scsi-0DO_Volume_transitboard-openbao-raft-1"

@@ -1,0 +1,13 @@
+# Per-node overrides for the metadata service. The image ships this empty on purpose: a working node
+# needs nothing set here.
+
+# How long to wait for the metadata service before giving up. Fifteen attempts three seconds apart,
+# because "the network is up" and "the metadata service answers" are not the same instant. Everything
+# that needs the node's identity declares `need metadata`, so raising this delays those services and
+# lowering it risks a boot that loses the race.
+#IMDS_ATTEMPTS=15
+#IMDS_TIMEOUT=3
+
+# The metadata service itself, overridable only so the appliance can be exercised against a faked one
+# under QEMU. Nothing on a Droplet should set this.
+#IMDS_URL="http://169.254.169.254/metadata/v1"
